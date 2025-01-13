@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
-from liveprice import get_live_price
-from database import insert_alert, delete_alert, get_alerts, create_db
+from AlertsProgram.liveprice import get_live_price
+from AlertsProgram.database import insert_alert, delete_alert, get_alerts, create_db
 import bcrypt
 import jwt
 import datetime

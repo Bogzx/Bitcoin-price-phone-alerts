@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Alert Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .container {
+            max-width: 600px;
+            margin: auto;
+        }
+        .card {
+            border: 1px solid #ddd;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+        .button {
+            background-color: #007BFF;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Real-Time Alert Dashboard</h1>
+
+    <!-- Login Section -->
+    <div class="card" id="login-section">
+        <h2>Login</h2>
+        <label for="username">Username:</label>
+        <input type="text" id="username" placeholder="Enter username" />
+        <br />
+        <label for="password">Password:</label>
+        <input type="password" id="password" placeholder="Enter password" />
+        <br />
+        <button class="button" onclick="login()">Login</button>
+        <p id="login-error" style="color: red;"></p>
+    </div>
+
+    <!-- Dashboard Section -->
+    <div class="card" id="dashboard-section" style="display: none;">
+        <h2>Live Price</h2>
+        <p id="live-price">Fetching...</p>
+        <h2>Alerts</h2>
+        <ul id="alerts-list"></ul>
+        <h3>Add Alert</h3>
+        <label for="phone">Phone:</label>
+        <input type="text" id="phone" placeholder="Enter phone number" />
+        <br />
+        <label for="threshold">Threshold:</label>
+        <input type="number" id="threshold" placeholder="Enter price threshold" />
+        <br />
+        <label for="type">Type:</label>
+        <select id="type">
+            <option value="high">High</option>
+            <option value="low">Low</option>
+        </select>
+        <br />
+        <label for="message">Message:</label>
+        <input type="text" id="message" placeholder="Enter alert message" />
+        <br />
+        <button class="button" onclick="addAlert()">Add Alert</button>
+    </div>
+</div>
+
+<script>
+    let token = null;
+
+    async function login() {
+        const username = document.getElementById('username').value;
+        const password = document.getElementById('password').value;
+
+        try {
+            const response = await axios.post('/login', { username, password });
+            token = response.data.token;
+
+            // Show dashboard and fetch data
+            document.getElementById('login-section').style.display = 'none';
+            document.getElementById('dashboard-section').style.display = 'block';
+            fetchLivePrice();
+            fetchAlerts();
+        } catch (error) {
+            document.getElementById('login-error').textContent = 'Invalid username or password.';
+        }
+    }
+
+    async function fetchLivePrice() {
+        try {
+            const response = await axios.get('/price');
+            document.getElementById('live-price').textContent = `Current Price: $${response.data.price}`;
+        } catch (error) {
+            document.getElementById('live-price').textContent = 'Failed to fetch live price.';
+        }
+    }
+
+    async function fetchAlerts() {
+        try {
+            const response = await axios.get('/alerts', {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            const alerts = response.data;
+            const alertsList = document.getElementById('alerts-list');
+            alertsList.innerHTML = '';
+            alerts.forEach(alert => {
+                const li = document.createElement('li');
+                li.textContent = `Phone: ${alert.phone}, Threshold: ${alert.threshold}, Type: ${alert.type}`;
+                alertsList.appendChild(li);
+            });
+        } catch (error) {
+            console.error('Failed to fetch alerts:', error);
+        }
+    }
+
+    async function addAlert() {
+        const phone = document.getElementById('phone').value;
+        const threshold = document.getElementById('threshold').value;
+        const type = document.getElementById('type').value;
+        const message = document.getElementById('message').value;
+
+        try {
+            await axios.post('/alerts', { phone, threshold, type, message }, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            fetchAlerts();
+        } catch (error) {
+            console.error('Failed to add alert:', error);
+        }
+    }
+</script>
+</body>
+</html>

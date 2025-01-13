@@ -1,6 +1,7 @@
-from flask import Flask, request, jsonify
-from AlertsProgram.liveprice import get_live_price
-from AlertsProgram.database import insert_alert, delete_alert, get_alerts, create_db
+from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
+from liveprice import get_live_price
+from database import insert_alert, delete_alert, get_alerts, create_db
 import bcrypt
 import jwt
 import datetime
@@ -8,6 +9,9 @@ import datetime
 # Initialize Flask app
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'  # Use a secure secret key
+
+# Enable Cross-Origin Resource Sharing (CORS)
+CORS(app)
 
 # In-memory user storage for prototype (use database in production)
 users = {}
@@ -71,6 +75,11 @@ def live_price():
     if price is None:
         return jsonify({'message': 'Price not available'}), 503
     return jsonify({'price': price})
+
+# Serve the frontend
+@app.route('/')
+def index():
+    return render_template('proto_frontend.html')
 
 if __name__ == '__main__':
     create_db()  # Ensure database is created

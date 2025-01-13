@@ -1,6 +1,6 @@
-from liveprice import get_live_price
+from AlertsProgram.liveprice import get_live_price
 import logging
-from database import insert_alert,delete_alert,get_alerts
+from AlertsProgram.database import insert_alert,delete_alert,get_alerts
 
 def handle_user_input(threads_running):
     while threads_running.is_set():  # Check if the thread should keep running

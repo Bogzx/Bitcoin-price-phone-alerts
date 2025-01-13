@@ -1,7 +1,7 @@
 import sqlite3
 import logging
-from call import apeleaza
-from liveprice import get_live_price
+from AlertsProgram.call import apeleaza
+from AlertsProgram.liveprice import get_live_price
 import time
 def check_alerts(threads_running):
     # Open a persistent database connection for this function

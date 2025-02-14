@@ -14,7 +14,8 @@ app = Flask(__name__)
 app.config.from_object("config.Config")
 
 # Initialize SocketIO for live updates
-socketio = SocketIO(app)
+socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
+
 
 # Initialize Flask-Login
 login_manager = LoginManager(app)
@@ -150,43 +151,84 @@ def add_alert():
         flash("Alert added successfully!", "success")
         return redirect(url_for("index"))
     return render_template("add_alert.html", current_btc_price=current_btc_price)
+    
+@app.route("/delete_alert/<int:alert_id>", methods=["POST"])
+@login_required
+def delete_alert(alert_id):
+    # Find the alert by ID
+    alert = Alert.query.get_or_404(alert_id)
+    
+    # Ensure the current user owns this alert
+    if alert.user_id != current_user.id:
+        flash("You are not authorized to delete this alert.", "danger")
+        return redirect(url_for("index"))
+    
+    # Delete the alert from the database
+    db.session.delete(alert)
+    db.session.commit()
+    
+    flash("Alert deleted successfully.", "success")
+    return redirect(url_for("index"))
+
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    # If there is at least one user in the database, disable new registrations
+    user_count = User.query.count()
+    if user_count > 0:
+        flash("Registration is disabled because an account already exists.", "danger")
+        return redirect(url_for("login"))
+
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+
     if request.method == "POST":
         username = request.form["username"]
         email = request.form["email"]
-        phone_number = request.form["phone_number"]  # Capture user's phone number
+        phone_number = request.form["phone_number"]  # If your form includes this
         password = request.form["password"]
+
         # Check if username or email already exists
         if User.query.filter((User.username == username) | (User.email == email)).first():
             flash("Username or email already exists.", "danger")
             return redirect(url_for("register"))
+
         new_user = User(username=username, email=email, phone_number=phone_number)
         new_user.set_password(password)
         db.session.add(new_user)
         db.session.commit()
+
         flash("Registration successful. Please log in.", "success")
         return redirect(url_for("login"))
+
     return render_template("register.html")
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+
     if request.method == "POST":
         username = request.form["username"]
         password = request.form["password"]
         user = User.query.filter_by(username=username).first()
+
+        # If user not found or password check fails, show an error
         if user is None or not user.check_password(password):
             flash("Invalid username or password.", "danger")
             return redirect(url_for("login"))
-        login_user(user)
+
+        # Check if "remember" checkbox was selected
+        remember_me = True if request.form.get("remember") == "on" else False
+
+        # Log the user in, passing the "remember" value
+        login_user(user, remember=remember_me)
         flash("Logged in successfully.", "success")
         return redirect(url_for("index"))
+
     return render_template("login.html")
+
 
 @app.route("/logout")
 @login_required
@@ -195,6 +237,25 @@ def logout():
     flash("Logged out successfully.", "success")
     return redirect(url_for("login"))
 
+
+
 if __name__ == "__main__":
-    start_ws_thread()
-    socketio.run(app, debug=True)
+    # Option 1: Start the Binance WebSocket using Socket.IO's background task helper
+    # This will run the start_binance_ws function in the background.
+    socketio.start_background_task(target=start_binance_ws)
+
+    # Option 2 (alternative): You can also manually start the Binance WebSocket in its own thread:
+    # from threading import Thread
+    # ws_thread = Thread(target=start_binance_ws)
+    # ws_thread.daemon = True
+    # ws_thread.start()
+
+    # Print a debug message (optional)
+    print("Starting Flask app with Socket.IO...")
+
+    # Run the Flask app with Socket.IO.
+    # Using use_reloader=False avoids starting the app twice in debug mode.
+    socketio.run(app, debug=False, use_reloader=False)
+
+
+

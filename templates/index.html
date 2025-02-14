@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!-- Viewport for Mobile Responsiveness -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BTC Alert Dashboard</title>
+  
   <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <!-- Custom CSS -->
@@ -13,10 +16,24 @@
   <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
     <div class="container">
       <a class="navbar-brand" href="{{ url_for('index') }}">BTC Alert</a>
-      <div class="collapse navbar-collapse">
+      <!-- Navbar Toggler (Hamburger Menu) for mobile -->
+      <button 
+        class="navbar-toggler" 
+        type="button" 
+        data-bs-toggle="collapse" 
+        data-bs-target="#navbarSupportedContent" 
+        aria-controls="navbarSupportedContent" 
+        aria-expanded="false" 
+        aria-label="Toggle navigation"
+      >
+        <span class="navbar-toggler-icon"></span>
+      </button>
+
+      <div class="collapse navbar-collapse" id="navbarSupportedContent">
         <ul class="navbar-nav ms-auto">
-          <li class="nav-item">
-            <span class="navbar-text me-3">Hello, {{ current_user.username }}</span>
+          <li class="nav-item d-flex align-items-center me-3">
+            <!-- Display the username as text, or you can style it as a nav-link -->
+            <span class="text-white">Hello, {{ current_user.username }}</span>
           </li>
           <li class="nav-item">
             <a class="nav-link" href="{{ url_for('add_alert') }}">Add Alert</a>
@@ -31,65 +48,102 @@
 
   <!-- Main Container -->
   <div class="container mt-4">
-    <h1>BTC Alert Dashboard</h1>
-    <p>Current BTC Price: <span id="btc-price">{{ current_btc_price if current_btc_price else "Loading..." }}</span></p>
+    <h1 class="mb-3">BTC Alert Dashboard</h1>
+    <p>
+      <strong>Current BTC Price:</strong> 
+      <span id="btc-price">{{ current_btc_price if current_btc_price else "Loading..." }}</span>
+    </p>
+
     <div class="row">
       <!-- Active Alerts Table -->
-      <div class="col-md-6">
+      <div class="col-md-6 mb-4">
         <h2>Active Alerts</h2>
-        <table id="active-alerts" class="table table-striped">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Price Threshold</th>
-              <th>Type</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for alert in active_alerts %}
-            <tr id="alert-{{ alert.id }}">
-              <td>{{ alert.id }}</td>
-              <td>{{ alert.price_threshold }}</td>
-              <td>{{ alert.alert_type }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-
-      <!-- Triggered Alerts (Collapsible) -->
-      <div class="col-md-6">
-        <h2>
-          <a class="btn btn-link" data-bs-toggle="collapse" href="#triggeredAlerts" role="button" aria-expanded="false" aria-controls="triggeredAlerts">
-            Triggered Alerts
-          </a>
-        </h2>
-        <div class="collapse" id="triggeredAlerts">
-          <table id="triggered-alerts" class="table table-striped">
+        <!-- Make the table responsive -->
+        <div class="table-responsive">
+          <table id="active-alerts" class="table table-striped align-middle">
             <thead>
               <tr>
                 <th>ID</th>
                 <th>Price Threshold</th>
                 <th>Type</th>
+                <th>Action</th> <!-- New column for the Delete button -->
               </tr>
             </thead>
             <tbody>
-              {% for alert in triggered_alerts %}
+              {% for alert in active_alerts %}
               <tr id="alert-{{ alert.id }}">
                 <td>{{ alert.id }}</td>
                 <td>{{ alert.price_threshold }}</td>
                 <td>{{ alert.alert_type }}</td>
+                <td>
+                  <!-- Delete form -->
+                  <form 
+                    action="{{ url_for('delete_alert', alert_id=alert.id) }}" 
+                    method="POST" 
+                    style="display:inline;"
+                  >
+                    <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                  </form>
+                </td>
               </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
       </div>
+
+      <!-- Triggered Alerts (Collapsible) -->
+      <div class="col-md-6">
+        <h2>
+          <button 
+            class="btn btn-link p-0" 
+            data-bs-toggle="collapse" 
+            data-bs-target="#triggeredAlerts" 
+            aria-expanded="false" 
+            aria-controls="triggeredAlerts"
+            style="text-decoration:none;"
+          >
+            Triggered Alerts <small class="text-muted">(Tap to expand)</small>
+          </button>
+        </h2>
+        <div class="collapse" id="triggeredAlerts">
+          <div class="table-responsive">
+            <table id="triggered-alerts" class="table table-striped align-middle">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Price Threshold</th>
+                  <th>Type</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for alert in triggered_alerts %}
+                <tr id="alert-{{ alert.id }}">
+                  <td>{{ alert.id }}</td>
+                  <td>{{ alert.price_threshold }}</td>
+                  <td>{{ alert.alert_type }}</td>
+                  <td>
+                    <form 
+                      action="{{ url_for('delete_alert', alert_id=alert.id) }}" 
+                      method="POST" 
+                      style="display:inline;"
+                    >
+                      <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                    </form>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
   <!-- Socket.IO and Bootstrap JS -->
-  <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
   <script>
     var socket = io();
@@ -105,7 +159,9 @@
       var row = document.getElementById('alert-' + alertId);
       if (row) {
         row.parentNode.removeChild(row);
-        var triggeredTableBody = document.getElementById('triggered-alerts').getElementsByTagName('tbody')[0];
+        var triggeredTableBody = document
+          .getElementById('triggered-alerts')
+          .getElementsByTagName('tbody')[0];
         triggeredTableBody.appendChild(row);
       }
     });

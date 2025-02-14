@@ -5,3 +5,4 @@ Flask-Login==0.6.2
 websocket-client==1.5.1
 twilio==7.16.0
 python-dotenv==0.21.0
+Werkzeug==2.2.2

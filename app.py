@@ -2,7 +2,6 @@ import os
 import json
 import time
 from threading import Thread
-
 from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_socketio import SocketIO, emit
 from flask_login import LoginManager, current_user, login_user, logout_user, login_required

@@ -136,6 +136,3 @@ The alerts are based on real-time data from Binance and typically trigger within
 
 ---
 
-<p align="center">
-  Made with ❤️ by <a href="https://github.com/yourusername">Your Name</a>
-</p>

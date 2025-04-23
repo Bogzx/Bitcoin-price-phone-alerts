@@ -172,11 +172,7 @@ def delete_alert(alert_id):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    # If there is at least one user in the database, disable new registrations
-    user_count = User.query.count()
-    if user_count > 0:
-        flash("Registration is disabled because an account already exists.", "danger")
-        return redirect(url_for("login"))
+    
 
     if current_user.is_authenticated:
         return redirect(url_for("index"))

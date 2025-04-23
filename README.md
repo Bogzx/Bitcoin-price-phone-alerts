@@ -6,7 +6,7 @@
 
 A real-time Bitcoin price monitoring service that calls your phone when BTC crosses your specified price thresholds.
 
-![Bitcoin Price Alert Dashboard](https://raw.githubusercontent.com/Bogzx/PhoneAlertsV2/67176fedfa9606fe52ddaa1d9fa27b076e6659ff/Screenshot%202025-04-23%20173519.png?token=GHSAT0AAAAAADCP2S2Y2XIIBOYX7HTQ4LJK2AJBP7Q)
+![Bitcoin Price Alert Dashboard](https://github.com/Bogzx/Bitcoin-price-phone-alerts/blob/main/Screenshot%202025-04-23%20173519.png?raw=true)
 
 ## ✨ Features
 

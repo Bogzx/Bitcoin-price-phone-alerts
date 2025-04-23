@@ -12,7 +12,8 @@ app = Flask(__name__)
 app.config.from_object("config.Config")
 
 # Initialize SocketIO for live updates
-socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
+# Limit CORS to your domain instead of "*"
+socketio = SocketIO(app, async_mode="threading", cors_allowed_origins=["http://localhost:5000", "https://yourdomain.com"])
 
 
 # Initialize Flask-Login

@@ -2,7 +2,12 @@ Flask==2.2.2
 Flask-SQLAlchemy==3.0.2
 Flask-SocketIO==5.3.3
 Flask-Login==0.6.2
+Flask-WTF==1.2.1
+Flask-Limiter==3.5.0
 websocket-client==1.5.1
 twilio==7.16.0
 python-dotenv==0.21.0
 Werkzeug==2.2.2
+
+# Tests
+pytest==7.4.4

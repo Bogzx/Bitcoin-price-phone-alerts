@@ -169,3 +169,81 @@ def test_logs_mask_the_phone_number(twilio, caplog):
 )
 def test_mask_phone(raw, masked):
     assert app_module.mask_phone(raw) == masked
+
+
+def test_retry_after_partial_failure_does_not_repeat_the_call(twilio):
+    """'both': call succeeded, SMS failed once. The retry must only send the SMS."""
+    real_sms = twilio.messages.create
+    failures = {"left": 1}
+
+    def flaky_sms(**kwargs):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise RuntimeError("SMS 500")
+        return real_sms(**kwargs)
+
+    twilio.messages.create = flaky_sms
+    seed("both")
+    tick(70100.0)
+    assert [kind for kind, _ in twilio.created] == ["call", "sms"]
+
+
+def test_notification_log_records_each_outcome(twilio):
+    from models import NotificationLog
+
+    seed("call")
+    tick(70100.0)
+    entry = NotificationLog.query.one()
+    assert entry.status == "sent"
+    assert entry.channel == "call"
+    assert "70,100.00" in entry.message
+
+
+def test_notification_log_records_failures(twilio):
+    from models import NotificationLog
+
+    twilio.fail_times = 99
+    seed("call")
+    tick(70100.0)
+    entry = NotificationLog.query.one()
+    assert entry.status == "failed"
+    assert "503" in entry.detail
+
+
+def test_global_daily_budget_caps_notifications_across_users(twilio, caplog):
+    from datetime import timedelta
+
+    from models import NotificationLog
+
+    flask_app.config["MAX_NOTIFICATIONS_PER_DAY"] = 2
+    try:
+        for i in range(3):
+            user = User(username=f"u{i}", email=f"u{i}@x.test", phone_number=f"+1415555010{i}")
+            user.set_password("pw")
+            db.session.add(user)
+            db.session.flush()
+            db.session.add(Alert(price_threshold=70000.0, alert_type="above", user_id=user.id))
+        db.session.commit()
+
+        tick(70100.0)
+        assert len(twilio.created) == 2
+        assert "budget" in caplog.text
+        assert Alert.query.filter_by(triggered=False).count() == 1  # held, not lost
+
+        # A day later the budget frees up and the held alert fires.
+        for entry in NotificationLog.query.all():
+            entry.created_at -= timedelta(days=1, seconds=1)
+        db.session.commit()
+        tick(70100.0)
+        assert len(twilio.created) == 3
+    finally:
+        flask_app.config["MAX_NOTIFICATIONS_PER_DAY"] = 50
+
+
+def test_dry_run_is_logged_as_dry_run(twilio):
+    from models import NotificationLog
+
+    flask_app.config["NOTIFY_DRY_RUN"] = True
+    seed("call")
+    tick(70100.0)
+    assert NotificationLog.query.one().status == "dry_run"

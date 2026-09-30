@@ -108,3 +108,20 @@ class Alert(db.Model):
     def __repr__(self):
         # Note: We use alert.user.phone_number when needed.
         return f"<Alert User:{self.user_id} {self.alert_type} {self.price_threshold}>"
+
+
+class NotificationLog(db.Model):
+    """One outbound notification: what was sent, to whom, and how it ended.
+
+    Doubles as the ledger for the global daily notification budget.
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    # Plain integers, not foreign keys: the log outlives deleted alerts.
+    alert_id = db.Column(db.Integer, nullable=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    channel = db.Column(db.String(10), nullable=False)
+    # "queued", "sent", "failed" or "dry_run".
+    status = db.Column(db.String(10), nullable=False, default="queued")
+    message = db.Column(db.String(255), nullable=True)
+    detail = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)

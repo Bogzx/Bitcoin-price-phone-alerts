@@ -76,6 +76,13 @@ class Config:
     MAX_ACTIVE_ALERTS_PER_USER = _env_int("MAX_ACTIVE_ALERTS_PER_USER", 5)
     # Minimum seconds between two outbound notifications for the same user.
     NOTIFY_COOLDOWN_SECONDS = _env_int("NOTIFY_COOLDOWN_SECONDS", 300)
+    # Deployment-wide cap on calls/SMS in any rolling 24 hours, across all users.
+    # Bounds the Twilio bill even if many accounts are abused at once. 0 = no cap.
+    MAX_NOTIFICATIONS_PER_DAY = _env_int("MAX_NOTIFICATIONS_PER_DAY", 50)
+    # Registration is open only while no account exists (the owner's first
+    # signup). Set true to let anyone register: every account can make this
+    # deployment phone an unverified number on your Twilio balance.
+    ALLOW_REGISTRATION = _env_bool("ALLOW_REGISTRATION", False)
     # Minimum seconds before a repeating alert can fire again.
     REPEAT_ALERT_COOLDOWN_SECONDS = _env_int("REPEAT_ALERT_COOLDOWN_SECONDS", 900)
     # A fired repeating alert re-arms only after the price moves this percent of

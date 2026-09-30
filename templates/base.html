@@ -44,9 +44,11 @@
           <li class="nav-item">
               <a class="nav-link" href="{{ url_for('login') }}">Login</a>
           </li>
+          {% if registration_open() %}
           <li class="nav-item">
               <a class="nav-link" href="{{ url_for('register') }}">Register</a>
           </li>
+          {% endif %}
           {% endif %}
         </ul>
       </div>

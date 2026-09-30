@@ -70,6 +70,19 @@ class Alert(db.Model):
             return price >= self.price_threshold
         return price <= self.price_threshold
 
+    def rearm_ready(self, price, hysteresis_percent=0.0):
+        """True when a fired repeating alert may re-arm at `price`.
+
+        The price has to leave the trigger zone by a band of `hysteresis_percent`
+        of the threshold. Without the band, BTC chopping a few dollars around the
+        threshold re-arms the alert on every dip and it calls again as soon as the
+        cooldown expires.
+        """
+        band = self.price_threshold * max(hysteresis_percent or 0.0, 0.0) / 100.0
+        if self.alert_type == "above":
+            return price < self.price_threshold - band
+        return price > self.price_threshold + band
+
     def is_due(self, price, cooldown_seconds=0, now=None):
         """True when this alert should fire a notification for `price` right now."""
         if self.triggered:

@@ -21,6 +21,7 @@ def ctx():
         WTF_CSRF_ENABLED=False,
         NOTIFY_COOLDOWN_SECONDS=300,
         REPEAT_ALERT_COOLDOWN_SECONDS=0,
+        REARM_HYSTERESIS_PERCENT=0.25,
     )
     with flask_app.app_context():
         db.drop_all()
@@ -176,3 +177,41 @@ def test_malformed_tick_is_ignored(ctx, calls):
     app_module.drain_notification_queue(retry_delay=0)
 
     assert calls["calls"] == []
+
+
+def test_repeat_alert_needs_the_hysteresis_band_to_rearm(ctx, calls):
+    """Chop around the threshold must not turn into a stream of calls."""
+    flask_app.config.update(REARM_HYSTERESIS_PERCENT=0.25, NOTIFY_COOLDOWN_SECONDS=0)
+    seed_alert(threshold=70000.0, alert_type="above", repeat=True)
+
+    tick(70010.0)   # fires
+    tick(69900.0)   # dipped $100, inside the $175 band: stays disarmed
+    tick(70020.0)
+    assert len(calls["calls"]) == 1
+    assert Alert.query.first().armed is False
+
+    tick(69800.0)   # left the band: re-arms
+    tick(70030.0)   # fires again
+    assert len(calls["calls"]) == 2
+
+
+def test_below_alert_hysteresis_band_is_above_the_threshold(ctx, calls):
+    flask_app.config.update(REARM_HYSTERESIS_PERCENT=1.0, NOTIFY_COOLDOWN_SECONDS=0)
+    seed_alert(threshold=60000.0, alert_type="below", repeat=True)
+
+    tick(59900.0)   # fires
+    tick(60500.0)   # +$500, band is $600: no re-arm
+    tick(59950.0)
+    assert len(calls["calls"]) == 1
+    tick(60700.0)   # re-arms
+    tick(59990.0)   # fires
+    assert len(calls["calls"]) == 2
+
+
+def test_zero_hysteresis_rearms_on_any_exit(ctx, calls):
+    flask_app.config.update(REARM_HYSTERESIS_PERCENT=0, NOTIFY_COOLDOWN_SECONDS=0)
+    seed_alert(threshold=70000.0, alert_type="above", repeat=True)
+    tick(70000.0)
+    tick(69999.99)
+    tick(70000.0)
+    assert len(calls["calls"]) == 2

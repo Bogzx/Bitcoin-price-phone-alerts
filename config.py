@@ -25,6 +25,16 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY")
     if not SECRET_KEY:
@@ -63,6 +73,10 @@ class Config:
     NOTIFY_COOLDOWN_SECONDS = _env_int("NOTIFY_COOLDOWN_SECONDS", 300)
     # Minimum seconds before a repeating alert can fire again.
     REPEAT_ALERT_COOLDOWN_SECONDS = _env_int("REPEAT_ALERT_COOLDOWN_SECONDS", 900)
+    # A fired repeating alert re-arms only after the price moves this percent of
+    # the threshold back out of the trigger zone (0.25% of $100k = $250). Set 0 to
+    # re-arm on any move out of the zone.
+    REARM_HYSTERESIS_PERCENT = _env_float("REARM_HYSTERESIS_PERCENT", 0.25)
     # Optional allowlist of E.164 country calling codes, e.g. "1,44,40".
     # Empty means "any country", which is the widest toll-fraud surface.
     ALLOWED_PHONE_COUNTRY_CODES = [

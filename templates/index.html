@@ -7,6 +7,12 @@
     <strong>Current BTC Price:</strong>
     <span id="btc-price">{{ current_btc_price if current_btc_price else "Loading..." }}</span>
   </p>
+  {% if current_btc_price and not price_fresh %}
+  <div id="feed-stale" class="alert alert-warning">
+    The price feed has been silent for {{ price_age|round|int }}s and is reconnecting.
+    Alerts cannot fire until prices resume.
+  </div>
+  {% endif %}
 
   <div class="row">
     <!-- Active Alerts Table -->
@@ -121,6 +127,10 @@
     // Listen for live price updates
     socket.on('price_update', function (data) {
       document.getElementById('btc-price').textContent = data.price;
+      var stale = document.getElementById('feed-stale');
+      if (stale) {
+        stale.parentNode.removeChild(stale);
+      }
     });
 
     // When an alert is triggered, move it from active to triggered alerts.

@@ -20,7 +20,7 @@ def client():
     # The auth rate limits are real (and tested separately); they would otherwise
     # make these tests order-dependent.
     app_module.limiter.enabled = False
-    app_module.current_btc_price = 70000.0
+    app_module.record_price(70000.0)
     with flask_app.app_context():
         db.drop_all()
         db.create_all()
@@ -29,6 +29,7 @@ def client():
         db.session.remove()
         db.drop_all()
     app_module.current_btc_price = None
+    app_module.feed_status.last_tick_monotonic = None
     app_module.limiter.enabled = True
 
 
@@ -188,3 +189,24 @@ def test_socketio_connect_works_for_logged_in_clients(client):
     sio = app_module.socketio.test_client(flask_app, flask_test_client=client)
     assert sio.is_connected() is True
     sio.disconnect()
+
+
+def test_stale_price_blocks_alert_creation(client):
+    """The alert direction is chosen against the live price; a stale one lies."""
+    make_user(client)
+    token = csrf_token(client, "/add_alert")
+    app_module.feed_status.last_tick_monotonic -= 10_000
+    response = client.post(
+        "/add_alert",
+        data={"csrf_token": token, "mode": "absolute", "price_threshold": "80000"},
+        follow_redirects=True,
+    )
+    assert "no recent price" in response.get_data(as_text=True)
+    assert Alert.query.count() == 0
+
+
+def test_dashboard_shows_stale_feed_banner(client):
+    make_user(client)
+    assert 'id="feed-stale"' not in client.get("/").get_data(as_text=True)
+    app_module.feed_status.last_tick_monotonic -= 10_000
+    assert 'id="feed-stale"' in client.get("/").get_data(as_text=True)

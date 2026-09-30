@@ -1,13 +1,14 @@
 import json
 import math
 import queue
+import random
 import re
 import socket
 import threading
 import time
 from xml.sax.saxutils import escape as xml_escape
 
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_login import LoginManager, current_user, login_user, logout_user, login_required
 from flask_wtf.csrf import CSRFProtect
@@ -280,19 +281,68 @@ def process_price_tick(price):
     return pending
 
 
+class FeedStatus:
+    """What the price feed is doing. Read by the watchdog, /healthz and the UI."""
+
+    def __init__(self):
+        self.connected = False
+        self.session_started = None  # time.monotonic() of the current session
+        self.last_tick_monotonic = None
+        self.last_tick_at = None  # naive UTC wall clock of the last price
+        self.consecutive_failures = 0
+        self.reconnects = 0
+        self.last_error = None
+
+    def age_seconds(self, now=None):
+        """Seconds since the last price, or None before the first one."""
+        if self.last_tick_monotonic is None:
+            return None
+        now = time.monotonic() if now is None else now
+        return now - self.last_tick_monotonic
+
+
+feed_status = FeedStatus()
+_feed_started = False
+_current_ws = None
+_last_price_emit = 0.0
+
+# Binance sends a ping every ~20s; ours detects a dead peer from our side too.
+WS_PING_INTERVAL_SECONDS = 20
+WS_PING_TIMEOUT_SECONDS = 10
+# Every trade is evaluated, but browsers only need a couple of updates a second.
+PRICE_EMIT_MIN_INTERVAL_SECONDS = 0.5
+
+
+def price_is_fresh(now=None):
+    """True when the last known price is recent enough to act on."""
+    age = feed_status.age_seconds(now)
+    return age is not None and age <= app.config["FEED_STALE_SECONDS"]
+
+
+def record_price(price, now=None):
+    """Stores a new price and marks the feed alive."""
+    global current_btc_price
+    current_btc_price = price
+    feed_status.last_tick_monotonic = time.monotonic() if now is None else now
+    feed_status.last_tick_at = utcnow()
+
+
 def on_message(ws, message):
     """Handles messages from Binance's WebSocket."""
-    global current_btc_price
+    global _last_price_emit
     try:
         data = json.loads(message)
         price = float(data.get("p", 0))
         if not math.isfinite(price) or price <= 0:
             return
-        current_btc_price = price
+        record_price(price)
         app.logger.debug(f"Current BTC Price: {price}")
 
-        # Emit the updated BTC price to connected clients
-        socketio.emit("price_update", {"price": price})
+        # Emit the updated BTC price to connected clients, throttled.
+        now = time.monotonic()
+        if now - _last_price_emit >= PRICE_EMIT_MIN_INTERVAL_SECONDS:
+            _last_price_emit = now
+            socketio.emit("price_update", {"price": price})
 
         with app.app_context():
             process_price_tick(price)
@@ -301,6 +351,14 @@ def on_message(ws, message):
 
 
 def on_error(ws, error):
+    feed_status.last_error = str(error)[:255]
+    if getattr(error, "status_code", None) == 451:
+        app.logger.error(
+            "Binance refused the connection with HTTP 451 (unavailable for legal "
+            "reasons): stream.binance.com blocks US IP addresses. Set BINANCE_WS_URL "
+            "to wss://stream.binance.us:9443/ws/btcusdt@trade if you are in the US."
+        )
+        return
     app.logger.error(f"WebSocket error: {error}")
 
 
@@ -308,36 +366,111 @@ def on_close(ws, close_status_code, close_msg):
     # No reconnect here: run_binance_ws() owns the reconnect loop. Calling
     # start_binance_ws() from this callback would recurse and eventually blow
     # the stack, because Binance closes long-lived streams roughly daily.
+    feed_status.connected = False
     app.logger.info(f"WebSocket connection closed ({close_status_code} {close_msg}).")
 
 
 def on_open(ws):
+    feed_status.connected = True
     app.logger.info("WebSocket connection established.")
 
 
-def start_binance_ws():
-    """Runs one Binance WebSocket session (returns when the stream closes)."""
-    websocket.enableTrace(False)
-    ws_url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-    ws = websocket.WebSocketApp(
-        ws_url,
+def start_binance_ws(ws_factory=None):
+    """Runs one Binance WebSocket session (returns when the stream closes).
+
+    Returns True when the session delivered at least one price.
+    """
+    global _current_ws
+    ws_factory = ws_factory or websocket.WebSocketApp
+    ws = ws_factory(
+        app.config["BINANCE_WS_URL"],
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
         on_open=on_open,
     )
-    ws.run_forever()
+    started = time.monotonic()
+    feed_status.session_started = started
+    _current_ws = ws
+    try:
+        ws.run_forever(
+            ping_interval=WS_PING_INTERVAL_SECONDS,
+            ping_timeout=WS_PING_TIMEOUT_SECONDS,
+        )
+    finally:
+        _current_ws = None
+        feed_status.connected = False
+    last = feed_status.last_tick_monotonic
+    return last is not None and last >= started
 
 
-def run_binance_ws():  # pragma: no cover - network loop
-    """Reconnect loop for the Binance feed."""
-    while True:
+def reconnect_delay(failures, rand=None):
+    """Exponential backoff with jitter: base * 2**failures, capped, times 0.5-1."""
+    rand = rand or random.random
+    base = max(app.config["FEED_RECONNECT_BASE_SECONDS"], 0)
+    cap = max(app.config["FEED_RECONNECT_MAX_SECONDS"], base)
+    delay = min(cap, base * (2 ** min(failures, 16)))
+    return delay * (0.5 + rand() / 2)
+
+
+def run_binance_ws(max_sessions=None, sleep=time.sleep, ws_factory=None):
+    """Reconnect loop for the Binance feed.
+
+    A session that delivered prices (e.g. Binance's routine 24h disconnect)
+    reconnects almost immediately; repeated failures back off up to the cap so
+    a geo-block or an outage is not hammered every few seconds.
+    """
+    sessions = 0
+    while max_sessions is None or sessions < max_sessions:
+        sessions += 1
+        got_prices = False
         try:
-            start_binance_ws()
+            got_prices = start_binance_ws(ws_factory)
         except Exception as exc:
+            feed_status.last_error = str(exc)[:255]
             app.logger.error(f"Binance WebSocket crashed: {exc}")
-        app.logger.info("Binance stream ended. Reconnecting in 5 seconds...")
-        time.sleep(5)
+        if got_prices:
+            feed_status.consecutive_failures = 0
+        else:
+            feed_status.consecutive_failures += 1
+        feed_status.reconnects += 1
+        delay = reconnect_delay(feed_status.consecutive_failures)
+        app.logger.info(
+            f"Binance stream ended ({feed_status.consecutive_failures} consecutive "
+            f"failed sessions). Reconnecting in {delay:.1f}s..."
+        )
+        sleep(delay)
+
+
+def check_feed_watchdog(now=None):
+    """Tears down a connected-but-silent socket. Returns True when it did.
+
+    websocket-client only notices a dead peer through ping timeouts, and a
+    half-open connection can otherwise sit forever while alerts never fire.
+    """
+    ws = _current_ws
+    if ws is None:
+        return False
+    now = time.monotonic() if now is None else now
+    last = max(feed_status.session_started or now, feed_status.last_tick_monotonic or 0)
+    silent_for = now - last
+    if silent_for <= app.config["FEED_STALE_SECONDS"]:
+        return False
+    feed_status.last_error = f"no price for {silent_for:.0f}s; reconnecting"
+    app.logger.warning(
+        f"Binance feed silent for {silent_for:.0f}s; closing the socket to reconnect."
+    )
+    try:
+        ws.close()
+    except Exception as exc:
+        app.logger.error(f"Could not close the stale WebSocket: {exc}")
+    return True
+
+
+def feed_watchdog(interval=5):  # pragma: no cover - background thread
+    while True:
+        time.sleep(interval)
+        check_feed_watchdog()
 
 
 _price_feed_lock_socket = None
@@ -378,10 +511,13 @@ def start_price_feed():
             f"{app.config['PRICE_FEED_LOCK_PORT']}; this worker will not run the feed."
         )
         return False
+    global _feed_started
     worker = threading.Thread(target=notification_worker, daemon=True)
     worker.start()
+    threading.Thread(target=feed_watchdog, daemon=True).start()
     socketio.start_background_task(target=run_binance_ws)
-    app.logger.info("Binance price feed started.")
+    _feed_started = True
+    app.logger.info(f"Binance price feed started ({app.config['BINANCE_WS_URL']}).")
     return True
 
 
@@ -445,8 +581,31 @@ def index():
         active_alerts=active_alerts,
         triggered_alerts=triggered_alerts,
         current_btc_price=current_btc_price,
+        price_fresh=price_is_fresh(),
+        price_age=feed_status.age_seconds(),
         max_alerts=app.config["MAX_ACTIVE_ALERTS_PER_USER"],
     )
+
+
+@app.route("/healthz")
+@limiter.exempt
+def healthz():
+    """Liveness of the alerting path, for an external uptime monitor.
+
+    Returns 503 when this process has no recent price, i.e. alerts cannot fire.
+    Point an uptime checker at it: a dead feed is otherwise invisible.
+    """
+    age = feed_status.age_seconds()
+    fresh = price_is_fresh()
+    body = {
+        "status": "ok" if fresh else "stale",
+        "feed_running": _feed_started,
+        "connected": feed_status.connected,
+        "last_price_age_seconds": None if age is None else round(age, 1),
+        "reconnects": feed_status.reconnects,
+        "notifications_queued": notification_queue.qsize(),
+    }
+    return jsonify(body), 200 if fresh else 503
 
 
 @app.route("/add_alert", methods=["GET", "POST"])
@@ -467,10 +626,11 @@ def add_alert():
             return redirect(url_for("index"))
 
         # Without a price the alert direction cannot be determined, and the old
-        # default of "above" fired an unwanted call immediately.
-        if current_btc_price is None:
+        # default of "above" fired an unwanted call immediately. A stale price is
+        # just as bad: the direction is picked against where BTC used to be.
+        if current_btc_price is None or not price_is_fresh():
             flash(
-                "The Bitcoin price feed has not delivered a price yet. "
+                "The Bitcoin price feed has no recent price. "
                 "Please try again in a few seconds.",
                 "warning",
             )
@@ -530,7 +690,7 @@ def add_alert():
     ).count()
     return render_template(
         "add_alert.html",
-        current_btc_price=current_btc_price,
+        current_btc_price=current_btc_price if price_is_fresh() else None,
         active_count=active_count,
         max_alerts=max_alerts,
     )

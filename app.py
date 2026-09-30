@@ -6,6 +6,7 @@ import re
 import socket
 import threading
 import time
+from datetime import timedelta
 from xml.sax.saxutils import escape as xml_escape
 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
@@ -51,7 +52,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
 # Import database and models
-from models import db, utcnow, Alert, User
+from models import db, utcnow, Alert, NotificationLog, User
 
 # Bind SQLAlchemy to the app and create tables if needed
 db.init_app(app)
@@ -161,12 +162,38 @@ def sms_user(phone_number, message):
 
 
 def deliver_notification(job):
-    """Sends one notification job. Raises on the first failing channel."""
+    """Sends one notification job. Raises on the first failing channel.
+
+    Channels that already went out are remembered on the job, so a retry after
+    "call ok, SMS failed" does not ring the phone a second time.
+    """
     channel = job.get("channel", "call")
-    if channel in ("call", "both"):
+    done = job.setdefault("delivered", [])
+    if channel in ("call", "both") and "call" not in done:
         call_user(job["phone_number"], job["message"])
-    if channel in ("sms", "both"):
+        done.append("call")
+    if channel in ("sms", "both") and "sms" not in done:
         sms_user(job["phone_number"], job["message"])
+        done.append("sms")
+
+
+def finish_notification_log(log_id, status, detail=None):
+    """Records how a queued notification ended."""
+    if log_id is None:
+        return
+    with app.app_context():
+        entry = db.session.get(NotificationLog, log_id)
+        if entry is None:
+            return
+        entry.status = status
+        entry.detail = None if detail is None else str(detail)[:255]
+        db.session.commit()
+
+
+def notifications_in_last_day(now=None):
+    now = now or utcnow()
+    since = now - timedelta(days=1)
+    return NotificationLog.query.filter(NotificationLog.created_at >= since).count()
 
 
 def record_notification_error(alert_id, error):
@@ -190,6 +217,8 @@ def process_notification(job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTI
     for attempt in range(1, max_attempts + 1):
         try:
             deliver_notification(job)
+            status = "dry_run" if app.config["NOTIFY_DRY_RUN"] else "sent"
+            finish_notification_log(job.get("log_id"), status)
             return True
         except Exception as exc:
             last_error = exc
@@ -200,6 +229,7 @@ def process_notification(job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTI
             if attempt < max_attempts and retry_delay:
                 time.sleep(retry_delay)
     record_notification_error(job.get("alert_id"), last_error)
+    finish_notification_log(job.get("log_id"), "failed", last_error)
     return False
 
 
@@ -247,6 +277,8 @@ def process_price_tick(price):
     user_cooldown = app.config["NOTIFY_COOLDOWN_SECONDS"]
     repeat_cooldown = app.config["REPEAT_ALERT_COOLDOWN_SECONDS"]
     hysteresis = app.config["REARM_HYSTERESIS_PERCENT"]
+    daily_budget = app.config["MAX_NOTIFICATIONS_PER_DAY"]
+    sent_today = None  # counted lazily, only when something is due
 
     pending = []
     changed = False
@@ -266,6 +298,13 @@ def process_price_tick(price):
                 f"{user_cooldown}s notification cooldown; skipping."
             )
             continue
+        if daily_budget > 0:
+            if sent_today is None:
+                sent_today = notifications_in_last_day(now)
+            if sent_today >= daily_budget:
+                _warn_budget_exhausted(daily_budget)
+                continue
+            sent_today += 1
 
         app.logger.info(
             f"Triggering alert {alert.id} for user {user.username}: "
@@ -280,13 +319,24 @@ def process_price_tick(price):
         # Setting this here also caps a user to one notification per tick.
         user.last_notified_at = now
         changed = True
+        message = f"{alert.describe()}. The current price is {price:,.2f}."
+        log_entry = NotificationLog(
+            alert_id=alert.id,
+            user_id=user.id,
+            channel=alert.notify_channel,
+            status="queued",
+            message=message[:255],
+            created_at=now,
+        )
+        db.session.add(log_entry)
         pending.append(
             {
+                "log": log_entry,
                 "alert_id": alert.id,
                 "user_id": user.id,
                 "phone_number": user.phone_number,
                 "channel": alert.notify_channel,
-                "message": f"{alert.describe()}. The current price is {price:,.2f}.",
+                "message": message,
                 "repeat": alert.repeat,
                 "price_threshold": alert.price_threshold,
                 "alert_type": alert.alert_type,
@@ -298,6 +348,7 @@ def process_price_tick(price):
         db.session.commit()
 
     for job in pending:
+        job["log_id"] = job.pop("log").id
         socketio.emit(
             "alert_triggered",
             {
@@ -357,6 +408,22 @@ def record_price(price, now=None):
     current_btc_price = price
     feed_status.last_tick_monotonic = time.monotonic() if now is None else now
     feed_status.last_tick_at = utcnow()
+
+
+_budget_warned_at = None
+
+
+def _warn_budget_exhausted(budget):
+    """Logs the exhausted global budget at most once every 10 minutes."""
+    global _budget_warned_at
+    now = time.monotonic()
+    if _budget_warned_at is not None and now - _budget_warned_at < 600:
+        return
+    _budget_warned_at = now
+    app.logger.warning(
+        f"Global notification budget of {budget} per 24h is used up; due alerts "
+        "are held until it frees up. Raise MAX_NOTIFICATIONS_PER_DAY if expected."
+    )
 
 
 def on_message(ws, message):
@@ -608,11 +675,18 @@ def index():
     # Show only alerts belonging to the logged-in user
     active_alerts = Alert.query.filter_by(user_id=current_user.id, triggered=False).all()
     triggered_alerts = Alert.query.filter_by(user_id=current_user.id, triggered=True).all()
+    recent_notifications = (
+        NotificationLog.query.filter_by(user_id=current_user.id)
+        .order_by(NotificationLog.created_at.desc(), NotificationLog.id.desc())
+        .limit(10)
+        .all()
+    )
     return render_template(
         "index.html",
         active_alerts=active_alerts,
         triggered_alerts=triggered_alerts,
         current_btc_price=current_btc_price,
+        recent_notifications=recent_notifications,
         price_fresh=price_is_fresh(),
         price_age=feed_status.age_seconds(),
         max_alerts=app.config["MAX_ACTIVE_ALERTS_PER_USER"],
@@ -747,11 +821,34 @@ def delete_alert(alert_id):
     return redirect(url_for("index"))
 
 
+def registration_open():
+    """Registration is for the owner's first account unless explicitly opened.
+
+    Phone numbers are not verified, so each extra account is someone who can
+    make this deployment call any number on the owner's Twilio balance.
+    """
+    if app.config["ALLOW_REGISTRATION"]:
+        return True
+    return db.session.query(User.id).first() is None
+
+
+@app.context_processor
+def inject_registration_open():
+    return {"registration_open": registration_open}
+
+
 @app.route("/register", methods=["GET", "POST"])
 @limiter.limit(lambda: app.config["REGISTER_RATE_LIMIT"], methods=["POST"])
 def register():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+    if not registration_open():
+        flash(
+            "Registration is closed on this deployment. Ask the owner to set "
+            "ALLOW_REGISTRATION=true if you need an account.",
+            "warning",
+        )
+        return redirect(url_for("login"))
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()

@@ -210,3 +210,52 @@ def test_dashboard_shows_stale_feed_banner(client):
     assert 'id="feed-stale"' not in client.get("/").get_data(as_text=True)
     app_module.feed_status.last_tick_monotonic -= 10_000
     assert 'id="feed-stale"' in client.get("/").get_data(as_text=True)
+
+
+def register_form(client, username):
+    token = csrf_token(client, "/login")
+    return client.post(
+        "/register",
+        data={
+            "csrf_token": token,
+            "username": username,
+            "email": f"{username}@example.com",
+            "phone_number": "+14155550199",
+            "password": "hunter2",
+        },
+        follow_redirects=True,
+    )
+
+
+def test_registration_closes_after_the_first_account(client):
+    flask_app.config["ALLOW_REGISTRATION"] = False
+    assert "Register here" in client.get("/login").get_data(as_text=True)
+    register_form(client, "owner")
+    assert User.query.count() == 1
+
+    body = register_form(client, "stranger").get_data(as_text=True)
+    assert "Registration is closed" in body
+    assert User.query.count() == 1
+    assert "Register here" not in client.get("/login").get_data(as_text=True)
+
+
+def test_allow_registration_reopens_signup(client):
+    flask_app.config["ALLOW_REGISTRATION"] = True
+    try:
+        register_form(client, "owner")
+        register_form(client, "friend")
+        assert User.query.count() == 2
+    finally:
+        flask_app.config["ALLOW_REGISTRATION"] = False
+
+
+def test_dashboard_lists_recent_notifications(client):
+    from models import NotificationLog
+
+    user = make_user(client)
+    db.session.add(
+        NotificationLog(user_id=user.id, channel="call", status="sent", message="BTC rose")
+    )
+    db.session.commit()
+    body = client.get("/").get_data(as_text=True)
+    assert "BTC rose" in body and "bg-success" in body

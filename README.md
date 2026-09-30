@@ -180,6 +180,8 @@ Before exposing it to the internet you would need, at minimum:
 
    The phone number must be in international (E.164) format, e.g. `+14155550123`.
    Only the first account can register; set `ALLOW_REGISTRATION=true` to allow more.
+   Register yours before the app is reachable from the internet: whoever registers
+   first on a fresh deployment owns it.
 
 4. **Create price alerts**
 
@@ -218,7 +220,7 @@ no credentials. CI runs them on Python 3.10, 3.12 and 3.14.
 | `TWILIO_PHONE_NUMBER` | Twilio Phone Number | None (required) |
 | `NOTIFY_DRY_RUN` | Log alerts instead of calling/texting; no Twilio needed | `false` |
 | `ALLOW_REGISTRATION` | Let anyone register. When `false`, only the first account can | `false` |
-| `MAX_NOTIFICATIONS_PER_DAY` | Deployment-wide cap on calls/SMS per rolling 24h (0 = none) | `50` |
+| `MAX_NOTIFICATIONS_PER_DAY` | Deployment-wide cap on calls/SMS per rolling 24h; a `both` alert counts as 2 (0 = none) | `50` |
 | `REARM_HYSTERESIS_PERCENT` | How far (in % of the threshold) the price must retreat before a repeating alert re-arms | `0.25` |
 | `BINANCE_WS_URL` | Binance trade stream URL | `wss://stream.binance.com:9443/ws/btcusdt@trade` |
 | `FEED_STALE_SECONDS` | Seconds without a trade before the socket is recycled and `/healthz` reports stale | `60` |

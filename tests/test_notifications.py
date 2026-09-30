@@ -277,3 +277,57 @@ def test_restart_requeues_recent_and_expires_old_notifications(twilio):
     statuses = {e.message: e.status for e in NotificationLog.query.all()}
     assert statuses == {"recent": "sent", "stale": "failed", "done": "sent"}
     assert "restarted" in db.session.get(Alert, alert.id).notify_error
+
+
+# --- review 2026-09-30 ---------------------------------------------------------
+
+def test_restart_mid_retry_does_not_ring_the_phone_again(twilio):
+    """'both': the call went out, the SMS was still being retried when the app
+    restarted. The row is still 'queued'; replaying it must only send the SMS."""
+    from models import NotificationLog
+
+    twilio.messages.create = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("SMS 500"))
+    seed("both")
+    app_module.on_message(None, json.dumps({"e": "trade", "p": "70100"}))
+    job = app_module.notification_queue.get_nowait()
+    app_module.notification_queue.task_done()
+    with pytest.raises(RuntimeError):
+        app_module.deliver_notification(job)  # the "crash": the call is out, SMS not
+    entry = NotificationLog.query.one()
+    assert entry.status == "queued" and entry.delivered == "call"
+
+    twilio.messages.create = twilio._make("sms", "SM")  # SMS works again
+    twilio.created.clear()
+    assert app_module.requeue_pending_notifications() == (1, 0)
+    app_module.drain_notification_queue(retry_delay=0)
+    assert [kind for kind, _ in twilio.created] == ["sms"]  # no second call
+    db.session.expire_all()
+    assert NotificationLog.query.one().status == "sent"
+
+
+def test_both_channel_counts_twice_against_the_daily_budget(twilio):
+    """The cap is documented as calls/SMS per day; 'both' is one of each."""
+    from models import NotificationLog
+
+    flask_app.config["MAX_NOTIFICATIONS_PER_DAY"] = 3
+    try:
+        for i, channel in enumerate(("both", "both")):
+            user = User(username=f"b{i}", email=f"b{i}@x.test", phone_number=f"+1415555020{i}")
+            user.set_password("pw")
+            db.session.add(user)
+            db.session.flush()
+            db.session.add(Alert(price_threshold=70000.0, alert_type="above",
+                                 user_id=user.id, notify_channel=channel))
+        db.session.commit()
+        tick(70100.0)
+        assert len(twilio.created) == 2  # one call + one SMS; the second "both" is held
+        assert NotificationLog.query.count() == 1
+        assert app_module.notifications_in_last_day() == 2
+    finally:
+        flask_app.config["MAX_NOTIFICATIONS_PER_DAY"] = 50
+
+
+def test_twilio_client_has_an_http_timeout(monkeypatch):
+    monkeypatch.setitem(flask_app.config, "NOTIFY_DRY_RUN", False)
+    client = app_module._build_twilio_client()
+    assert client.http_client.timeout == app_module.TWILIO_HTTP_TIMEOUT_SECONDS > 0

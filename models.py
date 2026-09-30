@@ -126,6 +126,10 @@ class NotificationLog(db.Model):
     status = db.Column(db.String(10), nullable=False, default="queued")
     message = db.Column(db.String(255), nullable=True)
     detail = db.Column(db.String(255), nullable=True)
+    # Channels already delivered ("call", "sms" or "call,sms"). A restart re-sends
+    # a still-"queued" row; this stops it ringing the phone a second time when
+    # the call went out and only the SMS was still being retried.
+    delivered = db.Column(db.String(20), nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
 
 

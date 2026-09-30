@@ -216,12 +216,14 @@ def process_price_tick(price):
     now = utcnow()
     user_cooldown = app.config["NOTIFY_COOLDOWN_SECONDS"]
     repeat_cooldown = app.config["REPEAT_ALERT_COOLDOWN_SECONDS"]
+    hysteresis = app.config["REARM_HYSTERESIS_PERCENT"]
 
     pending = []
     changed = False
     for alert in Alert.query.filter_by(triggered=False).all():
-        # A repeating alert re-arms once the price leaves its trigger zone.
-        if alert.repeat and not alert.armed and not alert.condition_met(price):
+        # A repeating alert re-arms once the price leaves its trigger zone by
+        # the hysteresis band.
+        if alert.repeat and not alert.armed and alert.rearm_ready(price, hysteresis):
             alert.armed = True
             changed = True
             continue

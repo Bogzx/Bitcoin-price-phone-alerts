@@ -259,3 +259,26 @@ def test_dashboard_lists_recent_notifications(client):
     db.session.commit()
     body = client.get("/").get_data(as_text=True)
     assert "BTC rose" in body and "bg-success" in body
+
+
+def test_threshold_equal_to_live_price_is_rejected(client):
+    make_user(client)
+    token = csrf_token(client, "/add_alert")
+    response = client.post(
+        "/add_alert",
+        data={"csrf_token": token, "mode": "absolute", "price_threshold": "70000"},
+        follow_redirects=True,
+    )
+    assert "equals the current price" in response.get_data(as_text=True)
+    assert Alert.query.count() == 0
+
+
+def test_below_alert_is_created_under_the_live_price(client):
+    make_user(client)
+    token = csrf_token(client, "/add_alert")
+    client.post(
+        "/add_alert",
+        data={"csrf_token": token, "mode": "absolute", "price_threshold": "65000"},
+        follow_redirects=True,
+    )
+    assert Alert.query.one().alert_type == "below"

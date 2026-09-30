@@ -20,6 +20,12 @@ import websocket
 # Initialize Flask app and load configuration
 app = Flask(__name__)
 app.config.from_object("config.Config")
+# Flask's logger defaults to WARNING outside debug mode, which hid every
+# "alert triggered" / "call placed" line in production.
+try:
+    app.logger.setLevel(app.config["LOG_LEVEL"])
+except ValueError:
+    app.logger.setLevel("INFO")
 
 # CSRF protection for every POST form (login, register, add_alert, delete_alert)
 csrf = CSRFProtect(app)
@@ -55,6 +61,11 @@ with app.app_context():
 
 def _build_twilio_client():
     """Builds the Twilio client, tolerating a missing/placeholder configuration."""
+    if app.config["NOTIFY_DRY_RUN"]:
+        app.logger.warning(
+            "NOTIFY_DRY_RUN is on: alerts are logged, no call or SMS is placed."
+        )
+        return None
     sid = app.config.get("TWILIO_ACCOUNT_SID")
     token = app.config.get("TWILIO_AUTH_TOKEN")
     if not sid or not token:
@@ -97,13 +108,30 @@ def load_user(user_id):
 # Notification delivery
 # ---------------------------------------------------------------------------
 
+def mask_phone(phone_number):
+    """Keeps the country code prefix and last 4 digits for logs: +1******0123."""
+    phone = phone_number or ""
+    if len(phone) <= 6:
+        return "***"
+    return phone[:2] + "*" * (len(phone) - 6) + phone[-4:]
+
+
+def _require_twilio():
+    if twilio_client is None:
+        raise RuntimeError("Twilio client is not configured")
+    if not twilio_phone_number:
+        raise RuntimeError("TWILIO_PHONE_NUMBER is not configured")
+
+
 def call_user(phone_number, message):
     """Places a Twilio voice call that reads `message` out loud.
 
     Raises on failure - the caller decides what to do about it.
     """
-    if twilio_client is None:
-        raise RuntimeError("Twilio client is not configured")
+    if app.config["NOTIFY_DRY_RUN"]:
+        app.logger.info(f"[dry-run] Would call {mask_phone(phone_number)}: {message}")
+        return "DRY-RUN"
+    _require_twilio()
     twiml = (
         "<Response><Say voice=\"alice\">{msg}</Say><Pause length=\"1\"/>"
         "<Say voice=\"alice\">{msg}</Say></Response>"
@@ -113,20 +141,22 @@ def call_user(phone_number, message):
         from_=twilio_phone_number,
         twiml=twiml,
     )
-    app.logger.info(f"Call initiated for {phone_number}, SID: {call.sid}")
+    app.logger.info(f"Call initiated for {mask_phone(phone_number)}, SID: {call.sid}")
     return call.sid
 
 
 def sms_user(phone_number, message):
     """Sends a Twilio SMS. Raises on failure."""
-    if twilio_client is None:
-        raise RuntimeError("Twilio client is not configured")
+    if app.config["NOTIFY_DRY_RUN"]:
+        app.logger.info(f"[dry-run] Would text {mask_phone(phone_number)}: {message}")
+        return "DRY-RUN"
+    _require_twilio()
     sms = twilio_client.messages.create(
         to=phone_number,
         from_=twilio_phone_number,
         body=message,
     )
-    app.logger.info(f"SMS sent to {phone_number}, SID: {sms.sid}")
+    app.logger.info(f"SMS sent to {mask_phone(phone_number)}, SID: {sms.sid}")
     return sms.sid
 
 

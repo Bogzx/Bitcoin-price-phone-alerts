@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import inspect, text
+
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_login import UserMixin
@@ -125,3 +127,42 @@ class NotificationLog(db.Model):
     message = db.Column(db.String(255), nullable=True)
     detail = db.Column(db.String(255), nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+
+
+def add_missing_columns(engine, logger=None):
+    """Adds columns that newer versions of the models define to an old SQLite DB.
+
+    create_all() creates missing tables but never alters existing ones, so a
+    database from before repeat/SMS/percent alerts crashed on the first query.
+    Additive only: nothing is dropped or rewritten. New columns are added as
+    nullable with the model's scalar default for existing rows. Other databases
+    are left alone; use a real migration tool there.
+    Returns the list of "table.column" names added.
+    """
+    if engine.dialect.name != "sqlite":
+        return []
+    added = []
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in db.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {col["name"] for col in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" '
+                ddl += column.type.compile(dialect=engine.dialect)
+                default = column.default
+                if default is not None and default.is_scalar:
+                    value = default.arg
+                    if isinstance(value, bool):
+                        value = int(value)
+                    ddl += " DEFAULT " + (
+                        f"'{value}'" if isinstance(value, str) else str(value)
+                    )
+                conn.execute(text(ddl))
+                added.append(f"{table.name}.{column.name}")
+    if added and logger is not None:
+        logger.warning(f"Upgraded the database schema, added: {', '.join(added)}")
+    return added

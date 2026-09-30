@@ -95,9 +95,10 @@ Before exposing it to the internet you would need, at minimum:
   message queue and a shared price cache.
 - **Every alert is re-evaluated on every trade tick** with a full table scan. Fine for a
   handful of users, not for many.
-- The schema gained columns (repeat/SMS/percent alerts, delivery errors). There are no
-  migrations: delete `alerts.db` and start fresh, or add the columns by hand. New
-  tables (the notification log) are created automatically.
+- No real migration tool. On SQLite, missing tables are created and missing columns
+  are added automatically at startup (additive only), so an `alerts.db` from an older
+  version keeps working. On other databases, add new columns by hand or adopt
+  Flask-Migrate.
 
 ## ✨ Features
 

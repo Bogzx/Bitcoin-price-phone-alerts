@@ -15,6 +15,7 @@ from flask_login import LoginManager, current_user, login_user, logout_user, log
 from flask_wtf.csrf import CSRFProtect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 import websocket
 
@@ -68,6 +69,9 @@ with app.app_context():
     add_missing_columns(db.engine, app.logger)
 
 
+TWILIO_HTTP_TIMEOUT_SECONDS = 30
+
+
 def _build_twilio_client():
     """Builds the Twilio client, tolerating a missing/placeholder configuration."""
     if app.config["NOTIFY_DRY_RUN"]:
@@ -83,7 +87,9 @@ def _build_twilio_client():
         )
         return None
     try:
-        return Client(sid, token)
+        # Twilio's default HTTP client has no timeout: one hung request would
+        # block the single notification worker, and every later alert, forever.
+        return Client(sid, token, http_client=TwilioHttpClient(timeout=TWILIO_HTTP_TIMEOUT_SECONDS))
     except Exception as exc:  # pragma: no cover - depends on local configuration
         app.logger.error(f"Could not create the Twilio client: {exc}")
         return None
@@ -182,9 +188,22 @@ def deliver_notification(job):
     if channel in ("call", "both") and "call" not in done:
         call_user(job["phone_number"], job["message"])
         done.append("call")
+        record_delivered(job.get("log_id"), done)
     if channel in ("sms", "both") and "sms" not in done:
         sms_user(job["phone_number"], job["message"])
         done.append("sms")
+        record_delivered(job.get("log_id"), done)
+
+
+def record_delivered(log_id, channels):
+    """Persists which channels went out, so a restart does not repeat them."""
+    if log_id is None:
+        return
+    with app.app_context():
+        entry = db.session.get(NotificationLog, log_id)
+        if entry is not None:
+            entry.delivered = ",".join(channels)
+            db.session.commit()
 
 
 def finish_notification_log(log_id, status, detail=None):
@@ -200,10 +219,17 @@ def finish_notification_log(log_id, status, detail=None):
         db.session.commit()
 
 
+def notification_cost(channel):
+    """Twilio sends a notification makes: "both" is a call and an SMS."""
+    return 2 if channel == "both" else 1
+
+
 def notifications_in_last_day(now=None):
+    """Calls plus SMS started in the last 24 hours (the budget's unit)."""
     now = now or utcnow()
     since = now - timedelta(days=1)
-    return NotificationLog.query.filter(NotificationLog.created_at >= since).count()
+    recent = NotificationLog.query.filter(NotificationLog.created_at >= since)
+    return recent.count() + recent.filter(NotificationLog.channel == "both").count()
 
 
 def record_notification_error(alert_id, error):
@@ -298,6 +324,7 @@ def requeue_pending_notifications(now=None):
                     "phone_number": user.phone_number,
                     "channel": entry.channel,
                     "message": entry.message,
+                    "delivered": entry.delivered.split(",") if entry.delivered else [],
                 }
             )
             requeued += 1
@@ -360,10 +387,11 @@ def process_price_tick(price):
         if daily_budget > 0:
             if sent_today is None:
                 sent_today = notifications_in_last_day(now)
-            if sent_today >= daily_budget:
+            cost = notification_cost(alert.notify_channel)
+            if sent_today + cost > daily_budget:
                 _warn_budget_exhausted(daily_budget)
                 continue
-            sent_today += 1
+            sent_today += cost
 
         app.logger.info(
             f"Triggering alert {alert.id} for user {user.username}: "
@@ -565,7 +593,8 @@ def start_binance_ws(ws_factory=None):
 def reconnect_delay(failures, rand=None):
     """Exponential backoff with jitter: base * 2**failures, capped, times 0.5-1."""
     rand = rand or random.random
-    base = max(app.config["FEED_RECONNECT_BASE_SECONDS"], 0)
+    # At least 1s: a base of 0 would reconnect in a tight loop with no sleep.
+    base = max(app.config["FEED_RECONNECT_BASE_SECONDS"], 1)
     cap = max(app.config["FEED_RECONNECT_MAX_SECONDS"], base)
     delay = min(cap, base * (2 ** min(failures, 16)))
     return delay * (0.5 + rand() / 2)
@@ -888,6 +917,20 @@ def delete_alert(alert_id):
     return redirect(url_for("index"))
 
 
+# Serialises the "is anyone registered yet?" check with the insert. Without it,
+# two simultaneous first registrations both see an empty table and both get in.
+_registration_lock = threading.Lock()
+
+
+def _registration_closed():
+    flash(
+        "Registration is closed on this deployment. Ask the owner to set "
+        "ALLOW_REGISTRATION=true if you need an account.",
+        "warning",
+    )
+    return redirect(url_for("login"))
+
+
 def registration_open():
     """Registration is for the owner's first account unless explicitly opened.
 
@@ -910,12 +953,7 @@ def register():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
     if not registration_open():
-        flash(
-            "Registration is closed on this deployment. Ask the owner to set "
-            "ALLOW_REGISTRATION=true if you need an account.",
-            "warning",
-        )
-        return redirect(url_for("login"))
+        return _registration_closed()
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
@@ -938,15 +976,29 @@ def register():
             flash(error, "danger")
             return redirect(url_for("register"))
 
-        # Check if username or email already exists
-        if User.query.filter((User.username == username) | (User.email == email)).first():
-            flash("Username or email already exists.", "danger")
-            return redirect(url_for("register"))
-
         new_user = User(username=username, email=email, phone_number=phone_number)
-        new_user.set_password(password)
-        db.session.add(new_user)
-        db.session.commit()
+        new_user.set_password(password)  # slow (scrypt), so outside the lock
+
+        with _registration_lock:
+            # Checked again: the check at the top ran before the password hashing.
+            if not registration_open():
+                return _registration_closed()
+            if User.query.filter(
+                (User.username == username) | (User.email == email)
+            ).first():
+                flash("Username or email already exists.", "danger")
+                return redirect(url_for("register"))
+            db.session.add(new_user)
+            db.session.commit()
+
+        # Another process (only one is supported, but still) may have registered
+        # the first account at the same moment: the lowest id keeps it.
+        if not app.config["ALLOW_REGISTRATION"]:
+            first_id = db.session.query(db.func.min(User.id)).scalar()
+            if first_id != new_user.id:
+                db.session.delete(new_user)
+                db.session.commit()
+                return _registration_closed()
 
         flash("Registration successful. Please log in.", "success")
         return redirect(url_for("login"))

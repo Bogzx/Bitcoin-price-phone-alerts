@@ -191,3 +191,12 @@ def test_healthz_reports_stale_then_ok():
     body = response.get_json()
     assert body["status"] == "ok"
     assert body["last_price_age_seconds"] < 5
+
+
+def test_zero_backoff_base_cannot_spin():
+    """FEED_RECONNECT_BASE_SECONDS=0 used to give a zero delay: a tight reconnect loop."""
+    flask_app.config["FEED_RECONNECT_BASE_SECONDS"] = 0
+    try:
+        assert app_module.reconnect_delay(0, rand=lambda: 0.0) >= 0.5
+    finally:
+        flask_app.config["FEED_RECONNECT_BASE_SECONDS"] = 1

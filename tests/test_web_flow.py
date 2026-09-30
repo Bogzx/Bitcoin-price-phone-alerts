@@ -308,3 +308,38 @@ def test_logout_requires_post(client):
     response = client.post("/logout", data={"csrf_token": token})
     assert response.status_code == 302
     assert client.get("/").status_code == 302  # back to login
+
+
+def test_first_account_registered_during_hashing_closes_signup(client, monkeypatch):
+    """Two simultaneous first registrations: both pass the 'no users yet' check,
+    then spend ~100 ms hashing. Here the other one commits during that window;
+    this request must then be refused, not become a second account."""
+    flask_app.config["ALLOW_REGISTRATION"] = False
+    original = User.set_password
+
+    def hash_while_another_signup_lands(self, password):
+        if not User.query.count():
+            rival = User(username="rival", email="rival@example.com",
+                         phone_number="+14155550100", password_hash="x")
+            db.session.add(rival)
+            db.session.commit()
+        original(self, password)
+
+    monkeypatch.setattr(User, "set_password", hash_while_another_signup_lands)
+    body = register_form(client, "second").get_data(as_text=True)
+    assert "Registration is closed" in body
+    assert [u.username for u in User.query.all()] == ["rival"]
+
+
+def test_lower_id_wins_if_another_process_registered_first(client, monkeypatch):
+    """Cross-process backstop: if the in-process check was passed but a lower id
+    exists after commit, the newcomer is removed again."""
+    flask_app.config["ALLOW_REGISTRATION"] = False
+    owner = User(username="owner", email="owner@example.com",
+                 phone_number="+14155550100", password_hash="x")
+    db.session.add(owner)
+    db.session.commit()
+    monkeypatch.setattr(app_module, "registration_open", lambda: True)  # the lost race
+    body = register_form(client, "second").get_data(as_text=True)
+    assert "Registration is closed" in body
+    assert [u.username for u in User.query.all()] == ["owner"]

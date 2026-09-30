@@ -51,6 +51,11 @@ class Config:
     TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
     TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
+    # Log alerts instead of calling Twilio. Lets you run and demo the whole app
+    # without a Twilio account or spending money.
+    NOTIFY_DRY_RUN = _env_bool("NOTIFY_DRY_RUN", False)
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
     # --- Cookie / session hardening -------------------------------------------------
     # Secure cookies are the default. Serving the app over plain HTTP (e.g. the
     # localhost dev setup in the README) requires SESSION_COOKIE_SECURE=false,

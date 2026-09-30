@@ -1,24 +1,33 @@
 import json
 import math
 import queue
+import random
 import re
 import socket
 import threading
 import time
+from datetime import timedelta
 from xml.sax.saxutils import escape as xml_escape
 
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_login import LoginManager, current_user, login_user, logout_user, login_required
 from flask_wtf.csrf import CSRFProtect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 import websocket
 
 # Initialize Flask app and load configuration
 app = Flask(__name__)
 app.config.from_object("config.Config")
+# Flask's logger defaults to WARNING outside debug mode, which hid every
+# "alert triggered" / "call placed" line in production.
+try:
+    app.logger.setLevel(app.config["LOG_LEVEL"])
+except ValueError:
+    app.logger.setLevel("INFO")
 
 # CSRF protection for every POST form (login, register, add_alert, delete_alert)
 csrf = CSRFProtect(app)
@@ -44,16 +53,32 @@ login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
 # Import database and models
-from models import db, utcnow, Alert, User
+from models import (  # noqa: E402 - needs `app` configured first
+    Alert,
+    NotificationLog,
+    User,
+    add_missing_columns,
+    db,
+    utcnow,
+)
 
-# Bind SQLAlchemy to the app and create tables if needed
+# Bind SQLAlchemy to the app, create tables and add columns an old DB lacks.
 db.init_app(app)
 with app.app_context():
     db.create_all()
+    add_missing_columns(db.engine, app.logger)
+
+
+TWILIO_HTTP_TIMEOUT_SECONDS = 30
 
 
 def _build_twilio_client():
     """Builds the Twilio client, tolerating a missing/placeholder configuration."""
+    if app.config["NOTIFY_DRY_RUN"]:
+        app.logger.warning(
+            "NOTIFY_DRY_RUN is on: alerts are logged, no call or SMS is placed."
+        )
+        return None
     sid = app.config.get("TWILIO_ACCOUNT_SID")
     token = app.config.get("TWILIO_AUTH_TOKEN")
     if not sid or not token:
@@ -62,7 +87,9 @@ def _build_twilio_client():
         )
         return None
     try:
-        return Client(sid, token)
+        # Twilio's default HTTP client has no timeout: one hung request would
+        # block the single notification worker, and every later alert, forever.
+        return Client(sid, token, http_client=TwilioHttpClient(timeout=TWILIO_HTTP_TIMEOUT_SECONDS))
     except Exception as exc:  # pragma: no cover - depends on local configuration
         app.logger.error(f"Could not create the Twilio client: {exc}")
         return None
@@ -85,6 +112,8 @@ NOTIFY_RETRY_DELAY_SECONDS = 5
 
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 VALID_CHANNELS = ("call", "sms", "both")
+# An account controls phone calls billed to the owner; "a" is not a password.
+MIN_PASSWORD_LENGTH = 8
 
 
 @login_manager.user_loader
@@ -96,13 +125,30 @@ def load_user(user_id):
 # Notification delivery
 # ---------------------------------------------------------------------------
 
+def mask_phone(phone_number):
+    """Keeps the country code prefix and last 4 digits for logs: +1******0123."""
+    phone = phone_number or ""
+    if len(phone) <= 6:
+        return "***"
+    return phone[:2] + "*" * (len(phone) - 6) + phone[-4:]
+
+
+def _require_twilio():
+    if twilio_client is None:
+        raise RuntimeError("Twilio client is not configured")
+    if not twilio_phone_number:
+        raise RuntimeError("TWILIO_PHONE_NUMBER is not configured")
+
+
 def call_user(phone_number, message):
     """Places a Twilio voice call that reads `message` out loud.
 
     Raises on failure - the caller decides what to do about it.
     """
-    if twilio_client is None:
-        raise RuntimeError("Twilio client is not configured")
+    if app.config["NOTIFY_DRY_RUN"]:
+        app.logger.info(f"[dry-run] Would call {mask_phone(phone_number)}: {message}")
+        return "DRY-RUN"
+    _require_twilio()
     twiml = (
         "<Response><Say voice=\"alice\">{msg}</Say><Pause length=\"1\"/>"
         "<Say voice=\"alice\">{msg}</Say></Response>"
@@ -112,30 +158,78 @@ def call_user(phone_number, message):
         from_=twilio_phone_number,
         twiml=twiml,
     )
-    app.logger.info(f"Call initiated for {phone_number}, SID: {call.sid}")
+    app.logger.info(f"Call initiated for {mask_phone(phone_number)}, SID: {call.sid}")
     return call.sid
 
 
 def sms_user(phone_number, message):
     """Sends a Twilio SMS. Raises on failure."""
-    if twilio_client is None:
-        raise RuntimeError("Twilio client is not configured")
+    if app.config["NOTIFY_DRY_RUN"]:
+        app.logger.info(f"[dry-run] Would text {mask_phone(phone_number)}: {message}")
+        return "DRY-RUN"
+    _require_twilio()
     sms = twilio_client.messages.create(
         to=phone_number,
         from_=twilio_phone_number,
         body=message,
     )
-    app.logger.info(f"SMS sent to {phone_number}, SID: {sms.sid}")
+    app.logger.info(f"SMS sent to {mask_phone(phone_number)}, SID: {sms.sid}")
     return sms.sid
 
 
 def deliver_notification(job):
-    """Sends one notification job. Raises on the first failing channel."""
+    """Sends one notification job. Raises on the first failing channel.
+
+    Channels that already went out are remembered on the job, so a retry after
+    "call ok, SMS failed" does not ring the phone a second time.
+    """
     channel = job.get("channel", "call")
-    if channel in ("call", "both"):
+    done = job.setdefault("delivered", [])
+    if channel in ("call", "both") and "call" not in done:
         call_user(job["phone_number"], job["message"])
-    if channel in ("sms", "both"):
+        done.append("call")
+        record_delivered(job.get("log_id"), done)
+    if channel in ("sms", "both") and "sms" not in done:
         sms_user(job["phone_number"], job["message"])
+        done.append("sms")
+        record_delivered(job.get("log_id"), done)
+
+
+def record_delivered(log_id, channels):
+    """Persists which channels went out, so a restart does not repeat them."""
+    if log_id is None:
+        return
+    with app.app_context():
+        entry = db.session.get(NotificationLog, log_id)
+        if entry is not None:
+            entry.delivered = ",".join(channels)
+            db.session.commit()
+
+
+def finish_notification_log(log_id, status, detail=None):
+    """Records how a queued notification ended."""
+    if log_id is None:
+        return
+    with app.app_context():
+        entry = db.session.get(NotificationLog, log_id)
+        if entry is None:
+            return
+        entry.status = status
+        entry.detail = None if detail is None else str(detail)[:255]
+        db.session.commit()
+
+
+def notification_cost(channel):
+    """Twilio sends a notification makes: "both" is a call and an SMS."""
+    return 2 if channel == "both" else 1
+
+
+def notifications_in_last_day(now=None):
+    """Calls plus SMS started in the last 24 hours (the budget's unit)."""
+    now = now or utcnow()
+    since = now - timedelta(days=1)
+    recent = NotificationLog.query.filter(NotificationLog.created_at >= since)
+    return recent.count() + recent.filter(NotificationLog.channel == "both").count()
 
 
 def record_notification_error(alert_id, error):
@@ -153,12 +247,16 @@ def record_notification_error(alert_id, error):
         )
 
 
-def process_notification(job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTIFY_RETRY_DELAY_SECONDS):
+def process_notification(
+    job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTIFY_RETRY_DELAY_SECONDS
+):
     """Delivers a job, retrying on failure. Returns True when delivered."""
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             deliver_notification(job)
+            status = "dry_run" if app.config["NOTIFY_DRY_RUN"] else "sent"
+            finish_notification_log(job.get("log_id"), status)
             return True
         except Exception as exc:
             last_error = exc
@@ -169,6 +267,7 @@ def process_notification(job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTI
             if attempt < max_attempts and retry_delay:
                 time.sleep(retry_delay)
     record_notification_error(job.get("alert_id"), last_error)
+    finish_notification_log(job.get("log_id"), "failed", last_error)
     return False
 
 
@@ -188,6 +287,54 @@ def drain_notification_queue(**kwargs):
         finally:
             notification_queue.task_done()
         processed += 1
+
+
+# A notification still "queued" this long after a restart is not worth
+# delivering: the price has moved on and the call would only confuse.
+REQUEUE_MAX_AGE_SECONDS = 600
+
+
+def requeue_pending_notifications(now=None):
+    """Re-queues notifications that a restart dropped from the in-memory queue.
+
+    The alert is committed as fired before the job is queued, so without this
+    a crash or deploy in that window swallowed the call. Recent jobs are sent;
+    old ones are marked failed so the user sees what happened.
+    Returns (requeued, expired).
+    """
+    now = now or utcnow()
+    cutoff = now - timedelta(seconds=REQUEUE_MAX_AGE_SECONDS)
+    requeued = expired = 0
+    with app.app_context():
+        for entry in NotificationLog.query.filter_by(status="queued").all():
+            user = db.session.get(User, entry.user_id)
+            if user is None or entry.created_at < cutoff:
+                entry.status = "failed"
+                entry.detail = "Not delivered: the app restarted before sending it."
+                alert = db.session.get(Alert, entry.alert_id) if entry.alert_id else None
+                if alert is not None:
+                    alert.notify_error = entry.detail
+                expired += 1
+                continue
+            notification_queue.put(
+                {
+                    "log_id": entry.id,
+                    "alert_id": entry.alert_id,
+                    "user_id": user.id,
+                    "phone_number": user.phone_number,
+                    "channel": entry.channel,
+                    "message": entry.message,
+                    "delivered": entry.delivered.split(",") if entry.delivered else [],
+                }
+            )
+            requeued += 1
+        db.session.commit()
+    if requeued or expired:
+        app.logger.warning(
+            f"Recovered notifications after restart: {requeued} re-queued, "
+            f"{expired} too old and marked failed."
+        )
+    return requeued, expired
 
 
 def notification_worker():  # pragma: no cover - background thread
@@ -215,12 +362,16 @@ def process_price_tick(price):
     now = utcnow()
     user_cooldown = app.config["NOTIFY_COOLDOWN_SECONDS"]
     repeat_cooldown = app.config["REPEAT_ALERT_COOLDOWN_SECONDS"]
+    hysteresis = app.config["REARM_HYSTERESIS_PERCENT"]
+    daily_budget = app.config["MAX_NOTIFICATIONS_PER_DAY"]
+    sent_today = None  # counted lazily, only when something is due
 
     pending = []
     changed = False
     for alert in Alert.query.filter_by(triggered=False).all():
-        # A repeating alert re-arms once the price leaves its trigger zone.
-        if alert.repeat and not alert.armed and not alert.condition_met(price):
+        # A repeating alert re-arms once the price leaves its trigger zone by
+        # the hysteresis band.
+        if alert.repeat and not alert.armed and alert.rearm_ready(price, hysteresis):
             alert.armed = True
             changed = True
             continue
@@ -233,6 +384,14 @@ def process_price_tick(price):
                 f"{user_cooldown}s notification cooldown; skipping."
             )
             continue
+        if daily_budget > 0:
+            if sent_today is None:
+                sent_today = notifications_in_last_day(now)
+            cost = notification_cost(alert.notify_channel)
+            if sent_today + cost > daily_budget:
+                _warn_budget_exhausted(daily_budget)
+                continue
+            sent_today += cost
 
         app.logger.info(
             f"Triggering alert {alert.id} for user {user.username}: "
@@ -247,13 +406,24 @@ def process_price_tick(price):
         # Setting this here also caps a user to one notification per tick.
         user.last_notified_at = now
         changed = True
+        message = f"{alert.describe()}. The current price is {price:,.2f}."
+        log_entry = NotificationLog(
+            alert_id=alert.id,
+            user_id=user.id,
+            channel=alert.notify_channel,
+            status="queued",
+            message=message[:255],
+            created_at=now,
+        )
+        db.session.add(log_entry)
         pending.append(
             {
+                "log": log_entry,
                 "alert_id": alert.id,
                 "user_id": user.id,
                 "phone_number": user.phone_number,
                 "channel": alert.notify_channel,
-                "message": f"{alert.describe()}. The current price is {price:,.2f}.",
+                "message": message,
                 "repeat": alert.repeat,
                 "price_threshold": alert.price_threshold,
                 "alert_type": alert.alert_type,
@@ -265,6 +435,7 @@ def process_price_tick(price):
         db.session.commit()
 
     for job in pending:
+        job["log_id"] = job.pop("log").id
         socketio.emit(
             "alert_triggered",
             {
@@ -280,19 +451,84 @@ def process_price_tick(price):
     return pending
 
 
+class FeedStatus:
+    """What the price feed is doing. Read by the watchdog, /healthz and the UI."""
+
+    def __init__(self):
+        self.connected = False
+        self.session_started = None  # time.monotonic() of the current session
+        self.last_tick_monotonic = None
+        self.last_tick_at = None  # naive UTC wall clock of the last price
+        self.consecutive_failures = 0
+        self.reconnects = 0
+        self.last_error = None
+
+    def age_seconds(self, now=None):
+        """Seconds since the last price, or None before the first one."""
+        if self.last_tick_monotonic is None:
+            return None
+        now = time.monotonic() if now is None else now
+        return now - self.last_tick_monotonic
+
+
+feed_status = FeedStatus()
+_feed_started = False
+_current_ws = None
+_last_price_emit = 0.0
+
+# Binance sends a ping every ~20s; ours detects a dead peer from our side too.
+WS_PING_INTERVAL_SECONDS = 20
+WS_PING_TIMEOUT_SECONDS = 10
+# Every trade is evaluated, but browsers only need a couple of updates a second.
+PRICE_EMIT_MIN_INTERVAL_SECONDS = 0.5
+
+
+def price_is_fresh(now=None):
+    """True when the last known price is recent enough to act on."""
+    age = feed_status.age_seconds(now)
+    return age is not None and age <= app.config["FEED_STALE_SECONDS"]
+
+
+def record_price(price, now=None):
+    """Stores a new price and marks the feed alive."""
+    global current_btc_price
+    current_btc_price = price
+    feed_status.last_tick_monotonic = time.monotonic() if now is None else now
+    feed_status.last_tick_at = utcnow()
+
+
+_budget_warned_at = None
+
+
+def _warn_budget_exhausted(budget):
+    """Logs the exhausted global budget at most once every 10 minutes."""
+    global _budget_warned_at
+    now = time.monotonic()
+    if _budget_warned_at is not None and now - _budget_warned_at < 600:
+        return
+    _budget_warned_at = now
+    app.logger.warning(
+        f"Global notification budget of {budget} per 24h is used up; due alerts "
+        "are held until it frees up. Raise MAX_NOTIFICATIONS_PER_DAY if expected."
+    )
+
+
 def on_message(ws, message):
     """Handles messages from Binance's WebSocket."""
-    global current_btc_price
+    global _last_price_emit
     try:
         data = json.loads(message)
         price = float(data.get("p", 0))
         if not math.isfinite(price) or price <= 0:
             return
-        current_btc_price = price
+        record_price(price)
         app.logger.debug(f"Current BTC Price: {price}")
 
-        # Emit the updated BTC price to connected clients
-        socketio.emit("price_update", {"price": price})
+        # Emit the updated BTC price to connected clients, throttled.
+        now = time.monotonic()
+        if now - _last_price_emit >= PRICE_EMIT_MIN_INTERVAL_SECONDS:
+            _last_price_emit = now
+            socketio.emit("price_update", {"price": price})
 
         with app.app_context():
             process_price_tick(price)
@@ -301,6 +537,14 @@ def on_message(ws, message):
 
 
 def on_error(ws, error):
+    feed_status.last_error = str(error)[:255]
+    if getattr(error, "status_code", None) == 451:
+        app.logger.error(
+            "Binance refused the connection with HTTP 451 (unavailable for legal "
+            "reasons): stream.binance.com blocks US IP addresses. Set BINANCE_WS_URL "
+            "to wss://stream.binance.us:9443/ws/btcusdt@trade if you are in the US."
+        )
+        return
     app.logger.error(f"WebSocket error: {error}")
 
 
@@ -308,36 +552,112 @@ def on_close(ws, close_status_code, close_msg):
     # No reconnect here: run_binance_ws() owns the reconnect loop. Calling
     # start_binance_ws() from this callback would recurse and eventually blow
     # the stack, because Binance closes long-lived streams roughly daily.
+    feed_status.connected = False
     app.logger.info(f"WebSocket connection closed ({close_status_code} {close_msg}).")
 
 
 def on_open(ws):
+    feed_status.connected = True
     app.logger.info("WebSocket connection established.")
 
 
-def start_binance_ws():
-    """Runs one Binance WebSocket session (returns when the stream closes)."""
-    websocket.enableTrace(False)
-    ws_url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-    ws = websocket.WebSocketApp(
-        ws_url,
+def start_binance_ws(ws_factory=None):
+    """Runs one Binance WebSocket session (returns when the stream closes).
+
+    Returns True when the session delivered at least one price.
+    """
+    global _current_ws
+    ws_factory = ws_factory or websocket.WebSocketApp
+    ws = ws_factory(
+        app.config["BINANCE_WS_URL"],
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
         on_open=on_open,
     )
-    ws.run_forever()
+    started = time.monotonic()
+    feed_status.session_started = started
+    _current_ws = ws
+    try:
+        ws.run_forever(
+            ping_interval=WS_PING_INTERVAL_SECONDS,
+            ping_timeout=WS_PING_TIMEOUT_SECONDS,
+        )
+    finally:
+        _current_ws = None
+        feed_status.connected = False
+    last = feed_status.last_tick_monotonic
+    return last is not None and last >= started
 
 
-def run_binance_ws():  # pragma: no cover - network loop
-    """Reconnect loop for the Binance feed."""
-    while True:
+def reconnect_delay(failures, rand=None):
+    """Exponential backoff with jitter: base * 2**failures, capped, times 0.5-1."""
+    rand = rand or random.random
+    # At least 1s: a base of 0 would reconnect in a tight loop with no sleep.
+    base = max(app.config["FEED_RECONNECT_BASE_SECONDS"], 1)
+    cap = max(app.config["FEED_RECONNECT_MAX_SECONDS"], base)
+    delay = min(cap, base * (2 ** min(failures, 16)))
+    return delay * (0.5 + rand() / 2)
+
+
+def run_binance_ws(max_sessions=None, sleep=time.sleep, ws_factory=None):
+    """Reconnect loop for the Binance feed.
+
+    A session that delivered prices (e.g. Binance's routine 24h disconnect)
+    reconnects almost immediately; repeated failures back off up to the cap so
+    a geo-block or an outage is not hammered every few seconds.
+    """
+    sessions = 0
+    while max_sessions is None or sessions < max_sessions:
+        sessions += 1
+        got_prices = False
         try:
-            start_binance_ws()
+            got_prices = start_binance_ws(ws_factory)
         except Exception as exc:
+            feed_status.last_error = str(exc)[:255]
             app.logger.error(f"Binance WebSocket crashed: {exc}")
-        app.logger.info("Binance stream ended. Reconnecting in 5 seconds...")
-        time.sleep(5)
+        if got_prices:
+            feed_status.consecutive_failures = 0
+        else:
+            feed_status.consecutive_failures += 1
+        feed_status.reconnects += 1
+        delay = reconnect_delay(feed_status.consecutive_failures)
+        app.logger.info(
+            f"Binance stream ended ({feed_status.consecutive_failures} consecutive "
+            f"failed sessions). Reconnecting in {delay:.1f}s..."
+        )
+        sleep(delay)
+
+
+def check_feed_watchdog(now=None):
+    """Tears down a connected-but-silent socket. Returns True when it did.
+
+    websocket-client only notices a dead peer through ping timeouts, and a
+    half-open connection can otherwise sit forever while alerts never fire.
+    """
+    ws = _current_ws
+    if ws is None:
+        return False
+    now = time.monotonic() if now is None else now
+    last = max(feed_status.session_started or now, feed_status.last_tick_monotonic or 0)
+    silent_for = now - last
+    if silent_for <= app.config["FEED_STALE_SECONDS"]:
+        return False
+    feed_status.last_error = f"no price for {silent_for:.0f}s; reconnecting"
+    app.logger.warning(
+        f"Binance feed silent for {silent_for:.0f}s; closing the socket to reconnect."
+    )
+    try:
+        ws.close()
+    except Exception as exc:
+        app.logger.error(f"Could not close the stale WebSocket: {exc}")
+    return True
+
+
+def feed_watchdog(interval=5):  # pragma: no cover - background thread
+    while True:
+        time.sleep(interval)
+        check_feed_watchdog()
 
 
 _price_feed_lock_socket = None
@@ -378,10 +698,14 @@ def start_price_feed():
             f"{app.config['PRICE_FEED_LOCK_PORT']}; this worker will not run the feed."
         )
         return False
+    global _feed_started
+    requeue_pending_notifications()
     worker = threading.Thread(target=notification_worker, daemon=True)
     worker.start()
+    threading.Thread(target=feed_watchdog, daemon=True).start()
     socketio.start_background_task(target=run_binance_ws)
-    app.logger.info("Binance price feed started.")
+    _feed_started = True
+    app.logger.info(f"Binance price feed started ({app.config['BINANCE_WS_URL']}).")
     return True
 
 
@@ -440,13 +764,43 @@ def index():
     # Show only alerts belonging to the logged-in user
     active_alerts = Alert.query.filter_by(user_id=current_user.id, triggered=False).all()
     triggered_alerts = Alert.query.filter_by(user_id=current_user.id, triggered=True).all()
+    recent_notifications = (
+        NotificationLog.query.filter_by(user_id=current_user.id)
+        .order_by(NotificationLog.created_at.desc(), NotificationLog.id.desc())
+        .limit(10)
+        .all()
+    )
     return render_template(
         "index.html",
         active_alerts=active_alerts,
         triggered_alerts=triggered_alerts,
         current_btc_price=current_btc_price,
+        recent_notifications=recent_notifications,
+        price_fresh=price_is_fresh(),
+        price_age=feed_status.age_seconds(),
         max_alerts=app.config["MAX_ACTIVE_ALERTS_PER_USER"],
     )
+
+
+@app.route("/healthz")
+@limiter.exempt
+def healthz():
+    """Liveness of the alerting path, for an external uptime monitor.
+
+    Returns 503 when this process has no recent price, i.e. alerts cannot fire.
+    Point an uptime checker at it: a dead feed is otherwise invisible.
+    """
+    age = feed_status.age_seconds()
+    fresh = price_is_fresh()
+    body = {
+        "status": "ok" if fresh else "stale",
+        "feed_running": _feed_started,
+        "connected": feed_status.connected,
+        "last_price_age_seconds": None if age is None else round(age, 1),
+        "reconnects": feed_status.reconnects,
+        "notifications_queued": notification_queue.qsize(),
+    }
+    return jsonify(body), 200 if fresh else 503
 
 
 @app.route("/add_alert", methods=["GET", "POST"])
@@ -467,10 +821,11 @@ def add_alert():
             return redirect(url_for("index"))
 
         # Without a price the alert direction cannot be determined, and the old
-        # default of "above" fired an unwanted call immediately.
-        if current_btc_price is None:
+        # default of "above" fired an unwanted call immediately. A stale price is
+        # just as bad: the direction is picked against where BTC used to be.
+        if current_btc_price is None or not price_is_fresh():
             flash(
-                "The Bitcoin price feed has not delivered a price yet. "
+                "The Bitcoin price feed has no recent price. "
                 "Please try again in a few seconds.",
                 "warning",
             )
@@ -507,7 +862,14 @@ def add_alert():
             notify_channel = "call"
         repeat = request.form.get("repeat") == "on"
 
-        # Determine alert direction from the live price.
+        # Determine alert direction from the live price. A threshold equal to
+        # the live price would count as "below", be met already and call at once.
+        if round(price_threshold, 2) == round(current_btc_price, 2):
+            flash(
+                "That threshold equals the current price; pick a price above or below it.",
+                "danger",
+            )
+            return redirect(url_for("add_alert"))
         alert_type = "above" if price_threshold > current_btc_price else "below"
 
         new_alert = Alert(
@@ -530,7 +892,7 @@ def add_alert():
     ).count()
     return render_template(
         "add_alert.html",
-        current_btc_price=current_btc_price,
+        current_btc_price=current_btc_price if price_is_fresh() else None,
         active_count=active_count,
         max_alerts=max_alerts,
     )
@@ -555,11 +917,43 @@ def delete_alert(alert_id):
     return redirect(url_for("index"))
 
 
+# Serialises the "is anyone registered yet?" check with the insert. Without it,
+# two simultaneous first registrations both see an empty table and both get in.
+_registration_lock = threading.Lock()
+
+
+def _registration_closed():
+    flash(
+        "Registration is closed on this deployment. Ask the owner to set "
+        "ALLOW_REGISTRATION=true if you need an account.",
+        "warning",
+    )
+    return redirect(url_for("login"))
+
+
+def registration_open():
+    """Registration is for the owner's first account unless explicitly opened.
+
+    Phone numbers are not verified, so each extra account is someone who can
+    make this deployment call any number on the owner's Twilio balance.
+    """
+    if app.config["ALLOW_REGISTRATION"]:
+        return True
+    return db.session.query(User.id).first() is None
+
+
+@app.context_processor
+def inject_registration_open():
+    return {"registration_open": registration_open}
+
+
 @app.route("/register", methods=["GET", "POST"])
 @limiter.limit(lambda: app.config["REGISTER_RATE_LIMIT"], methods=["POST"])
 def register():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+    if not registration_open():
+        return _registration_closed()
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
@@ -569,6 +963,11 @@ def register():
         if not username or not email or not password:
             flash("Username, email and password are required.", "danger")
             return redirect(url_for("register"))
+        if len(password) < MIN_PASSWORD_LENGTH:
+            flash(
+                f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", "danger"
+            )
+            return redirect(url_for("register"))
 
         # The phone number is whatever the registrant types and is never verified,
         # so at minimum it has to be a plausible E.164 number.
@@ -577,15 +976,29 @@ def register():
             flash(error, "danger")
             return redirect(url_for("register"))
 
-        # Check if username or email already exists
-        if User.query.filter((User.username == username) | (User.email == email)).first():
-            flash("Username or email already exists.", "danger")
-            return redirect(url_for("register"))
-
         new_user = User(username=username, email=email, phone_number=phone_number)
-        new_user.set_password(password)
-        db.session.add(new_user)
-        db.session.commit()
+        new_user.set_password(password)  # slow (scrypt), so outside the lock
+
+        with _registration_lock:
+            # Checked again: the check at the top ran before the password hashing.
+            if not registration_open():
+                return _registration_closed()
+            if User.query.filter(
+                (User.username == username) | (User.email == email)
+            ).first():
+                flash("Username or email already exists.", "danger")
+                return redirect(url_for("register"))
+            db.session.add(new_user)
+            db.session.commit()
+
+        # Another process (only one is supported, but still) may have registered
+        # the first account at the same moment: the lowest id keeps it.
+        if not app.config["ALLOW_REGISTRATION"]:
+            first_id = db.session.query(db.func.min(User.id)).scalar()
+            if first_id != new_user.id:
+                db.session.delete(new_user)
+                db.session.commit()
+                return _registration_closed()
 
         flash("Registration successful. Please log in.", "success")
         return redirect(url_for("login"))
@@ -620,7 +1033,7 @@ def login():
     return render_template("login.html")
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 @login_required
 def logout():
     logout_user()

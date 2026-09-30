@@ -38,15 +38,20 @@
               <a class="nav-link" href="{{ url_for('add_alert') }}">Add Alert</a>
           </li>
           <li class="nav-item">
-              <a class="nav-link" href="{{ url_for('logout') }}">Logout</a>
+              <form action="{{ url_for('logout') }}" method="POST" class="d-inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="nav-link btn btn-link">Logout</button>
+              </form>
           </li>
           {% else %}
           <li class="nav-item">
               <a class="nav-link" href="{{ url_for('login') }}">Login</a>
           </li>
+          {% if registration_open() %}
           <li class="nav-item">
               <a class="nav-link" href="{{ url_for('register') }}">Register</a>
           </li>
+          {% endif %}
           {% endif %}
         </ul>
       </div>

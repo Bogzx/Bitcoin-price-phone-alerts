@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import inspect, text
+
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_login import UserMixin
@@ -70,6 +72,19 @@ class Alert(db.Model):
             return price >= self.price_threshold
         return price <= self.price_threshold
 
+    def rearm_ready(self, price, hysteresis_percent=0.0):
+        """True when a fired repeating alert may re-arm at `price`.
+
+        The price has to leave the trigger zone by a band of `hysteresis_percent`
+        of the threshold. Without the band, BTC chopping a few dollars around the
+        threshold re-arms the alert on every dip and it calls again as soon as the
+        cooldown expires.
+        """
+        band = self.price_threshold * max(hysteresis_percent or 0.0, 0.0) / 100.0
+        if self.alert_type == "above":
+            return price < self.price_threshold - band
+        return price > self.price_threshold + band
+
     def is_due(self, price, cooldown_seconds=0, now=None):
         """True when this alert should fire a notification for `price` right now."""
         if self.triggered:
@@ -95,3 +110,63 @@ class Alert(db.Model):
     def __repr__(self):
         # Note: We use alert.user.phone_number when needed.
         return f"<Alert User:{self.user_id} {self.alert_type} {self.price_threshold}>"
+
+
+class NotificationLog(db.Model):
+    """One outbound notification: what was sent, to whom, and how it ended.
+
+    Doubles as the ledger for the global daily notification budget.
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    # Plain integers, not foreign keys: the log outlives deleted alerts.
+    alert_id = db.Column(db.Integer, nullable=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    channel = db.Column(db.String(10), nullable=False)
+    # "queued", "sent", "failed" or "dry_run".
+    status = db.Column(db.String(10), nullable=False, default="queued")
+    message = db.Column(db.String(255), nullable=True)
+    detail = db.Column(db.String(255), nullable=True)
+    # Channels already delivered ("call", "sms" or "call,sms"). A restart re-sends
+    # a still-"queued" row; this stops it ringing the phone a second time when
+    # the call went out and only the SMS was still being retried.
+    delivered = db.Column(db.String(20), nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+
+
+def add_missing_columns(engine, logger=None):
+    """Adds columns that newer versions of the models define to an old SQLite DB.
+
+    create_all() creates missing tables but never alters existing ones, so a
+    database from before repeat/SMS/percent alerts crashed on the first query.
+    Additive only: nothing is dropped or rewritten. New columns are added as
+    nullable with the model's scalar default for existing rows. Other databases
+    are left alone; use a real migration tool there.
+    Returns the list of "table.column" names added.
+    """
+    if engine.dialect.name != "sqlite":
+        return []
+    added = []
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in db.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {col["name"] for col in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" '
+                ddl += column.type.compile(dialect=engine.dialect)
+                default = column.default
+                if default is not None and default.is_scalar:
+                    value = default.arg
+                    if isinstance(value, bool):
+                        value = int(value)
+                    ddl += " DEFAULT " + (
+                        f"'{value}'" if isinstance(value, str) else str(value)
+                    )
+                conn.execute(text(ddl))
+                added.append(f"{table.name}.{column.name}")
+    if added and logger is not None:
+        logger.warning(f"Upgraded the database schema, added: {', '.join(added)}")
+    return added

@@ -52,7 +52,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
 # Import database and models
-from models import db, utcnow, Alert, NotificationLog, User
+from models import db, utcnow, Alert, NotificationLog, User  # noqa: E402 - needs `app` configured first
 
 # Bind SQLAlchemy to the app and create tables if needed
 db.init_app(app)
@@ -211,7 +211,9 @@ def record_notification_error(alert_id, error):
         )
 
 
-def process_notification(job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTIFY_RETRY_DELAY_SECONDS):
+def process_notification(
+    job, max_attempts=NOTIFY_MAX_ATTEMPTS, retry_delay=NOTIFY_RETRY_DELAY_SECONDS
+):
     """Delivers a job, retrying on failure. Returns True when delivered."""
     last_error = None
     for attempt in range(1, max_attempts + 1):

@@ -247,3 +247,33 @@ def test_dry_run_is_logged_as_dry_run(twilio):
     seed("call")
     tick(70100.0)
     assert NotificationLog.query.one().status == "dry_run"
+
+
+def test_restart_requeues_recent_and_expires_old_notifications(twilio):
+    from datetime import timedelta
+
+    from models import NotificationLog, utcnow
+
+    alert = seed("call")
+    now = utcnow()
+    db.session.add_all(
+        [
+            NotificationLog(alert_id=alert.id, user_id=alert.user_id, channel="call",
+                            status="queued", message="recent", created_at=now),
+            NotificationLog(alert_id=alert.id, user_id=alert.user_id, channel="call",
+                            status="queued", message="stale",
+                            created_at=now - timedelta(hours=1)),
+            NotificationLog(alert_id=alert.id, user_id=alert.user_id, channel="call",
+                            status="sent", message="done", created_at=now),
+        ]
+    )
+    db.session.commit()
+
+    assert app_module.requeue_pending_notifications(now=now) == (1, 1)
+    app_module.drain_notification_queue(retry_delay=0)
+
+    assert len(twilio.created) == 1
+    assert "recent" in twilio.created[0][1]["twiml"]
+    statuses = {e.message: e.status for e in NotificationLog.query.all()}
+    assert statuses == {"recent": "sent", "stale": "failed", "done": "sent"}
+    assert "restarted" in db.session.get(Alert, alert.id).notify_error

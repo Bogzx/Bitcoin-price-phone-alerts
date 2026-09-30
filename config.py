@@ -80,6 +80,20 @@ class Config:
     RUN_PRICE_FEED = _env_bool("RUN_PRICE_FEED", True)
     # A localhost port used purely as a cross-process mutex for the feed.
     PRICE_FEED_LOCK_PORT = _env_int("PRICE_FEED_LOCK_PORT", 47653)
+    # Binance trade stream. stream.binance.com answers HTTP 451 to US IP addresses;
+    # from the US use wss://stream.binance.us:9443/ws/btcusdt@trade instead. The
+    # market-data-only mirror wss://data-stream.binance.vision/ws/btcusdt@trade
+    # works too (same geo rules as binance.com).
+    BINANCE_WS_URL = os.getenv(
+        "BINANCE_WS_URL", "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    )
+    # BTCUSDT trades every second or so. A socket that delivers nothing for this
+    # long is treated as dead and torn down, otherwise a half-open TCP connection
+    # would silently stop all alerts.
+    FEED_STALE_SECONDS = _env_int("FEED_STALE_SECONDS", 60)
+    # Reconnect backoff: doubles from the base up to the cap, with jitter.
+    FEED_RECONNECT_BASE_SECONDS = _env_int("FEED_RECONNECT_BASE_SECONDS", 1)
+    FEED_RECONNECT_MAX_SECONDS = _env_int("FEED_RECONNECT_MAX_SECONDS", 60)
 
     # Comma separated list of origins allowed to open a Socket.IO connection.
     CORS_ALLOWED_ORIGINS = [

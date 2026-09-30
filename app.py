@@ -773,7 +773,14 @@ def add_alert():
             notify_channel = "call"
         repeat = request.form.get("repeat") == "on"
 
-        # Determine alert direction from the live price.
+        # Determine alert direction from the live price. A threshold equal to
+        # the live price would count as "below", be met already and call at once.
+        if round(price_threshold, 2) == round(current_btc_price, 2):
+            flash(
+                "That threshold equals the current price; pick a price above or below it.",
+                "danger",
+            )
+            return redirect(url_for("add_alert"))
         alert_type = "above" if price_threshold > current_btc_price else "below"
 
         new_alert = Alert(

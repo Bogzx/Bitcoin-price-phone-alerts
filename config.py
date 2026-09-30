@@ -25,6 +25,16 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY")
     if not SECRET_KEY:
@@ -40,6 +50,11 @@ class Config:
     TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
     TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
     TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+
+    # Log alerts instead of calling Twilio. Lets you run and demo the whole app
+    # without a Twilio account or spending money.
+    NOTIFY_DRY_RUN = _env_bool("NOTIFY_DRY_RUN", False)
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
     # --- Cookie / session hardening -------------------------------------------------
     # Secure cookies are the default. Serving the app over plain HTTP (e.g. the
@@ -61,8 +76,19 @@ class Config:
     MAX_ACTIVE_ALERTS_PER_USER = _env_int("MAX_ACTIVE_ALERTS_PER_USER", 5)
     # Minimum seconds between two outbound notifications for the same user.
     NOTIFY_COOLDOWN_SECONDS = _env_int("NOTIFY_COOLDOWN_SECONDS", 300)
+    # Deployment-wide cap on calls/SMS in any rolling 24 hours, across all users.
+    # Bounds the Twilio bill even if many accounts are abused at once. 0 = no cap.
+    MAX_NOTIFICATIONS_PER_DAY = _env_int("MAX_NOTIFICATIONS_PER_DAY", 50)
+    # Registration is open only while no account exists (the owner's first
+    # signup). Set true to let anyone register: every account can make this
+    # deployment phone an unverified number on your Twilio balance.
+    ALLOW_REGISTRATION = _env_bool("ALLOW_REGISTRATION", False)
     # Minimum seconds before a repeating alert can fire again.
     REPEAT_ALERT_COOLDOWN_SECONDS = _env_int("REPEAT_ALERT_COOLDOWN_SECONDS", 900)
+    # A fired repeating alert re-arms only after the price moves this percent of
+    # the threshold back out of the trigger zone (0.25% of $100k = $250). Set 0 to
+    # re-arm on any move out of the zone.
+    REARM_HYSTERESIS_PERCENT = _env_float("REARM_HYSTERESIS_PERCENT", 0.25)
     # Optional allowlist of E.164 country calling codes, e.g. "1,44,40".
     # Empty means "any country", which is the widest toll-fraud surface.
     ALLOWED_PHONE_COUNTRY_CODES = [
@@ -80,6 +106,20 @@ class Config:
     RUN_PRICE_FEED = _env_bool("RUN_PRICE_FEED", True)
     # A localhost port used purely as a cross-process mutex for the feed.
     PRICE_FEED_LOCK_PORT = _env_int("PRICE_FEED_LOCK_PORT", 47653)
+    # Binance trade stream. stream.binance.com answers HTTP 451 to US IP addresses;
+    # from the US use wss://stream.binance.us:9443/ws/btcusdt@trade instead. The
+    # market-data-only mirror wss://data-stream.binance.vision/ws/btcusdt@trade
+    # works too (same geo rules as binance.com).
+    BINANCE_WS_URL = os.getenv(
+        "BINANCE_WS_URL", "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    )
+    # BTCUSDT trades every second or so. A socket that delivers nothing for this
+    # long is treated as dead and torn down, otherwise a half-open TCP connection
+    # would silently stop all alerts.
+    FEED_STALE_SECONDS = _env_int("FEED_STALE_SECONDS", 60)
+    # Reconnect backoff: doubles from the base up to the cap, with jitter.
+    FEED_RECONNECT_BASE_SECONDS = _env_int("FEED_RECONNECT_BASE_SECONDS", 1)
+    FEED_RECONNECT_MAX_SECONDS = _env_int("FEED_RECONNECT_MAX_SECONDS", 60)
 
     # Comma separated list of origins allowed to open a Socket.IO connection.
     CORS_ALLOWED_ORIGINS = [

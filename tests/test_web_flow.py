@@ -20,7 +20,7 @@ def client():
     # The auth rate limits are real (and tested separately); they would otherwise
     # make these tests order-dependent.
     app_module.limiter.enabled = False
-    app_module.current_btc_price = 70000.0
+    app_module.record_price(70000.0)
     with flask_app.app_context():
         db.drop_all()
         db.create_all()
@@ -29,6 +29,7 @@ def client():
         db.session.remove()
         db.drop_all()
     app_module.current_btc_price = None
+    app_module.feed_status.last_tick_monotonic = None
     app_module.limiter.enabled = True
 
 
@@ -137,7 +138,7 @@ def test_registration_rejects_non_e164_numbers(client, phone):
             "username": "carol",
             "email": "carol@example.com",
             "phone_number": phone,
-            "password": "hunter2",
+            "password": "hunter2-long",
         },
         follow_redirects=True,
     )
@@ -153,14 +154,14 @@ def test_registration_accepts_e164_and_hashes_the_password(client):
             "username": "carol",
             "email": "carol@example.com",
             "phone_number": "+40 712 345 678",
-            "password": "hunter2",
+            "password": "hunter2-long",
         },
         follow_redirects=True,
     )
     user = User.query.one()
     assert user.phone_number == "+40712345678"
     assert user.password_hash.startswith("pbkdf2:") or user.password_hash.startswith("scrypt:")
-    assert "hunter2" not in user.password_hash
+    assert "hunter2-long" not in user.password_hash
 
 
 def test_login_is_rate_limited(client):
@@ -188,3 +189,157 @@ def test_socketio_connect_works_for_logged_in_clients(client):
     sio = app_module.socketio.test_client(flask_app, flask_test_client=client)
     assert sio.is_connected() is True
     sio.disconnect()
+
+
+def test_stale_price_blocks_alert_creation(client):
+    """The alert direction is chosen against the live price; a stale one lies."""
+    make_user(client)
+    token = csrf_token(client, "/add_alert")
+    app_module.feed_status.last_tick_monotonic -= 10_000
+    response = client.post(
+        "/add_alert",
+        data={"csrf_token": token, "mode": "absolute", "price_threshold": "80000"},
+        follow_redirects=True,
+    )
+    assert "no recent price" in response.get_data(as_text=True)
+    assert Alert.query.count() == 0
+
+
+def test_dashboard_shows_stale_feed_banner(client):
+    make_user(client)
+    assert 'id="feed-stale"' not in client.get("/").get_data(as_text=True)
+    app_module.feed_status.last_tick_monotonic -= 10_000
+    assert 'id="feed-stale"' in client.get("/").get_data(as_text=True)
+
+
+def register_form(client, username):
+    token = csrf_token(client, "/login")
+    return client.post(
+        "/register",
+        data={
+            "csrf_token": token,
+            "username": username,
+            "email": f"{username}@example.com",
+            "phone_number": "+14155550199",
+            "password": "hunter2-long",
+        },
+        follow_redirects=True,
+    )
+
+
+def test_registration_closes_after_the_first_account(client):
+    flask_app.config["ALLOW_REGISTRATION"] = False
+    assert "Register here" in client.get("/login").get_data(as_text=True)
+    register_form(client, "owner")
+    assert User.query.count() == 1
+
+    body = register_form(client, "stranger").get_data(as_text=True)
+    assert "Registration is closed" in body
+    assert User.query.count() == 1
+    assert "Register here" not in client.get("/login").get_data(as_text=True)
+
+
+def test_allow_registration_reopens_signup(client):
+    flask_app.config["ALLOW_REGISTRATION"] = True
+    try:
+        register_form(client, "owner")
+        register_form(client, "friend")
+        assert User.query.count() == 2
+    finally:
+        flask_app.config["ALLOW_REGISTRATION"] = False
+
+
+def test_dashboard_lists_recent_notifications(client):
+    from models import NotificationLog
+
+    user = make_user(client)
+    db.session.add(
+        NotificationLog(user_id=user.id, channel="call", status="sent", message="BTC rose")
+    )
+    db.session.commit()
+    body = client.get("/").get_data(as_text=True)
+    assert "BTC rose" in body and "bg-success" in body
+
+
+def test_threshold_equal_to_live_price_is_rejected(client):
+    make_user(client)
+    token = csrf_token(client, "/add_alert")
+    response = client.post(
+        "/add_alert",
+        data={"csrf_token": token, "mode": "absolute", "price_threshold": "70000"},
+        follow_redirects=True,
+    )
+    assert "equals the current price" in response.get_data(as_text=True)
+    assert Alert.query.count() == 0
+
+
+def test_below_alert_is_created_under_the_live_price(client):
+    make_user(client)
+    token = csrf_token(client, "/add_alert")
+    client.post(
+        "/add_alert",
+        data={"csrf_token": token, "mode": "absolute", "price_threshold": "65000"},
+        follow_redirects=True,
+    )
+    assert Alert.query.one().alert_type == "below"
+
+
+def test_short_passwords_are_rejected(client):
+    token = csrf_token(client, "/register")
+    body = client.post(
+        "/register",
+        data={
+            "csrf_token": token,
+            "username": "erin",
+            "email": "erin@example.com",
+            "phone_number": "+14155550123",
+            "password": "short",
+        },
+        follow_redirects=True,
+    ).get_data(as_text=True)
+    assert "at least 8" in body
+    assert User.query.count() == 0
+
+
+def test_logout_requires_post(client):
+    make_user(client)
+    assert client.get("/logout").status_code == 405
+    token = csrf_token(client, "/")
+    response = client.post("/logout", data={"csrf_token": token})
+    assert response.status_code == 302
+    assert client.get("/").status_code == 302  # back to login
+
+
+def test_first_account_registered_during_hashing_closes_signup(client, monkeypatch):
+    """Two simultaneous first registrations: both pass the 'no users yet' check,
+    then spend ~100 ms hashing. Here the other one commits during that window;
+    this request must then be refused, not become a second account."""
+    flask_app.config["ALLOW_REGISTRATION"] = False
+    original = User.set_password
+
+    def hash_while_another_signup_lands(self, password):
+        if not User.query.count():
+            rival = User(username="rival", email="rival@example.com",
+                         phone_number="+14155550100", password_hash="x")
+            db.session.add(rival)
+            db.session.commit()
+        original(self, password)
+
+    monkeypatch.setattr(User, "set_password", hash_while_another_signup_lands)
+    body = register_form(client, "second").get_data(as_text=True)
+    assert "Registration is closed" in body
+    assert [u.username for u in User.query.all()] == ["rival"]
+
+
+def test_lower_id_wins_if_another_process_registered_first(client, monkeypatch):
+    """Cross-process backstop: if the in-process check was passed but a lower id
+    exists after commit, the newcomer is removed again."""
+    flask_app.config["ALLOW_REGISTRATION"] = False
+    owner = User(username="owner", email="owner@example.com",
+                 phone_number="+14155550100", password_hash="x")
+    db.session.add(owner)
+    db.session.commit()
+    monkeypatch.setattr(app_module, "registration_open", lambda: True)  # the lost race
+    body = register_form(client, "second").get_data(as_text=True)
+    assert "Registration is closed" in body
+    assert [u.username for u in User.query.all()] == ["owner"]

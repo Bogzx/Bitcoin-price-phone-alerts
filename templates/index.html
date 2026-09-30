@@ -7,6 +7,12 @@
     <strong>Current BTC Price:</strong>
     <span id="btc-price">{{ current_btc_price if current_btc_price else "Loading..." }}</span>
   </p>
+  {% if current_btc_price and not price_fresh %}
+  <div id="feed-stale" class="alert alert-warning">
+    The price feed has been silent for {{ price_age|round|int }}s and is reconnecting.
+    Alerts cannot fire until prices resume.
+  </div>
+  {% endif %}
 
   <div class="row">
     <!-- Active Alerts Table -->
@@ -111,6 +117,39 @@
       </div>
     </div>
   </div>
+
+  <h2 class="mt-4">Recent Notifications</h2>
+  {% if recent_notifications %}
+  <div class="table-responsive">
+    <table id="recent-notifications" class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>When (UTC)</th>
+          <th>Channel</th>
+          <th>Status</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for n in recent_notifications %}
+        <tr>
+          <td>{{ n.created_at.strftime("%Y-%m-%d %H:%M:%S") }}</td>
+          <td>{{ n.channel }}</td>
+          <td>
+            {% if n.status == "sent" %}<span class="badge bg-success">sent</span>
+            {% elif n.status == "failed" %}<span class="badge bg-danger" title="{{ n.detail or '' }}">failed</span>
+            {% elif n.status == "dry_run" %}<span class="badge bg-secondary">dry run</span>
+            {% else %}<span class="badge bg-info">{{ n.status }}</span>{% endif %}
+          </td>
+          <td>{{ n.message }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted">No notifications yet.</p>
+  {% endif %}
 {% endblock %}
 
 {% block scripts %}
@@ -121,6 +160,10 @@
     // Listen for live price updates
     socket.on('price_update', function (data) {
       document.getElementById('btc-price').textContent = data.price;
+      var stale = document.getElementById('feed-stale');
+      if (stale) {
+        stale.parentNode.removeChild(stale);
+      }
     });
 
     // When an alert is triggered, move it from active to triggered alerts.

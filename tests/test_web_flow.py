@@ -138,7 +138,7 @@ def test_registration_rejects_non_e164_numbers(client, phone):
             "username": "carol",
             "email": "carol@example.com",
             "phone_number": phone,
-            "password": "hunter2",
+            "password": "hunter2-long",
         },
         follow_redirects=True,
     )
@@ -154,14 +154,14 @@ def test_registration_accepts_e164_and_hashes_the_password(client):
             "username": "carol",
             "email": "carol@example.com",
             "phone_number": "+40 712 345 678",
-            "password": "hunter2",
+            "password": "hunter2-long",
         },
         follow_redirects=True,
     )
     user = User.query.one()
     assert user.phone_number == "+40712345678"
     assert user.password_hash.startswith("pbkdf2:") or user.password_hash.startswith("scrypt:")
-    assert "hunter2" not in user.password_hash
+    assert "hunter2-long" not in user.password_hash
 
 
 def test_login_is_rate_limited(client):
@@ -221,7 +221,7 @@ def register_form(client, username):
             "username": username,
             "email": f"{username}@example.com",
             "phone_number": "+14155550199",
-            "password": "hunter2",
+            "password": "hunter2-long",
         },
         follow_redirects=True,
     )
@@ -282,3 +282,29 @@ def test_below_alert_is_created_under_the_live_price(client):
         follow_redirects=True,
     )
     assert Alert.query.one().alert_type == "below"
+
+
+def test_short_passwords_are_rejected(client):
+    token = csrf_token(client, "/register")
+    body = client.post(
+        "/register",
+        data={
+            "csrf_token": token,
+            "username": "erin",
+            "email": "erin@example.com",
+            "phone_number": "+14155550123",
+            "password": "short",
+        },
+        follow_redirects=True,
+    ).get_data(as_text=True)
+    assert "at least 8" in body
+    assert User.query.count() == 0
+
+
+def test_logout_requires_post(client):
+    make_user(client)
+    assert client.get("/logout").status_code == 405
+    token = csrf_token(client, "/")
+    response = client.post("/logout", data={"csrf_token": token})
+    assert response.status_code == 302
+    assert client.get("/").status_code == 302  # back to login

@@ -98,6 +98,8 @@ NOTIFY_RETRY_DELAY_SECONDS = 5
 
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 VALID_CHANNELS = ("call", "sms", "both")
+# An account controls phone calls billed to the owner; "a" is not a password.
+MIN_PASSWORD_LENGTH = 8
 
 
 @login_manager.user_loader
@@ -251,6 +253,53 @@ def drain_notification_queue(**kwargs):
         finally:
             notification_queue.task_done()
         processed += 1
+
+
+# A notification still "queued" this long after a restart is not worth
+# delivering: the price has moved on and the call would only confuse.
+REQUEUE_MAX_AGE_SECONDS = 600
+
+
+def requeue_pending_notifications(now=None):
+    """Re-queues notifications that a restart dropped from the in-memory queue.
+
+    The alert is committed as fired before the job is queued, so without this
+    a crash or deploy in that window swallowed the call. Recent jobs are sent;
+    old ones are marked failed so the user sees what happened.
+    Returns (requeued, expired).
+    """
+    now = now or utcnow()
+    cutoff = now - timedelta(seconds=REQUEUE_MAX_AGE_SECONDS)
+    requeued = expired = 0
+    with app.app_context():
+        for entry in NotificationLog.query.filter_by(status="queued").all():
+            user = db.session.get(User, entry.user_id)
+            if user is None or entry.created_at < cutoff:
+                entry.status = "failed"
+                entry.detail = "Not delivered: the app restarted before sending it."
+                alert = db.session.get(Alert, entry.alert_id) if entry.alert_id else None
+                if alert is not None:
+                    alert.notify_error = entry.detail
+                expired += 1
+                continue
+            notification_queue.put(
+                {
+                    "log_id": entry.id,
+                    "alert_id": entry.alert_id,
+                    "user_id": user.id,
+                    "phone_number": user.phone_number,
+                    "channel": entry.channel,
+                    "message": entry.message,
+                }
+            )
+            requeued += 1
+        db.session.commit()
+    if requeued or expired:
+        app.logger.warning(
+            f"Recovered notifications after restart: {requeued} re-queued, "
+            f"{expired} too old and marked failed."
+        )
+    return requeued, expired
 
 
 def notification_worker():  # pragma: no cover - background thread
@@ -613,6 +662,7 @@ def start_price_feed():
         )
         return False
     global _feed_started
+    requeue_pending_notifications()
     worker = threading.Thread(target=notification_worker, daemon=True)
     worker.start()
     threading.Thread(target=feed_watchdog, daemon=True).start()
@@ -867,6 +917,11 @@ def register():
         if not username or not email or not password:
             flash("Username, email and password are required.", "danger")
             return redirect(url_for("register"))
+        if len(password) < MIN_PASSWORD_LENGTH:
+            flash(
+                f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", "danger"
+            )
+            return redirect(url_for("register"))
 
         # The phone number is whatever the registrant types and is never verified,
         # so at minimum it has to be a plausible E.164 number.
@@ -918,7 +973,7 @@ def login():
     return render_template("login.html")
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 @login_required
 def logout():
     logout_user()

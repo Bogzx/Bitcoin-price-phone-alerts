@@ -52,12 +52,20 @@ login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
 # Import database and models
-from models import db, utcnow, Alert, NotificationLog, User  # noqa: E402 - needs `app` configured first
+from models import (  # noqa: E402 - needs `app` configured first
+    Alert,
+    NotificationLog,
+    User,
+    add_missing_columns,
+    db,
+    utcnow,
+)
 
-# Bind SQLAlchemy to the app and create tables if needed
+# Bind SQLAlchemy to the app, create tables and add columns an old DB lacks.
 db.init_app(app)
 with app.app_context():
     db.create_all()
+    add_missing_columns(db.engine, app.logger)
 
 
 def _build_twilio_client():

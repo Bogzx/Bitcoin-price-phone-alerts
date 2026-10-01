@@ -36,6 +36,7 @@ def test_old_database_gains_new_columns_with_defaults(tmp_path):
     added = add_missing_columns(engine)
 
     assert "alert.repeat" in added and "user.last_notified_at" in added
+    assert "user.phone_verified_at" in added  # existing users start unverified
     assert add_missing_columns(engine) == []  # idempotent
 
     conn = sqlite3.connect(path)

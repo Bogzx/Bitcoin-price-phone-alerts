@@ -16,6 +16,8 @@ from .config import load_config
 from .extensions import csrf, limiter, login_manager, socketio
 from .models import add_missing_columns, db
 from .services import build_services, get_services, start_background_services
+from .settings import bp as settings_bp
+from .verification import bp as verify_bp, verification_required
 
 __all__ = ["create_app", "get_services", "start_background_services"]
 
@@ -52,6 +54,9 @@ def create_app(overrides=None):
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(alerts_bp)
+    app.register_blueprint(verify_bp)
+    app.register_blueprint(settings_bp)
+    _warn_about_unsafe_verification_settings(app)
 
     # Create missing tables and add columns an older database lacks.
     with app.app_context():
@@ -60,3 +65,20 @@ def create_app(overrides=None):
 
     app.extensions["btc_alerts"] = build_services(app)
     return app
+
+
+def _warn_about_unsafe_verification_settings(app):
+    config = app.config
+    if not verification_required(app):
+        if config["ALLOW_REGISTRATION"]:
+            app.logger.warning(
+                "ALLOW_REGISTRATION is on but REQUIRE_PHONE_VERIFICATION is off: anyone "
+                "who registers can make this deployment call any number on your Twilio "
+                "balance."
+            )
+        return
+    if not config["NOTIFY_DRY_RUN"] and not config.get("TWILIO_VERIFY_SERVICE_SID"):
+        app.logger.error(
+            "Phone verification is required but TWILIO_VERIFY_SERVICE_SID is not set: "
+            "nobody can verify a number, so no alert will fire."
+        )

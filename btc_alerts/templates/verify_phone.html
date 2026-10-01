@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Verify your phone{% endblock %}
+
+{% block content %}
+  <h1>Verify your phone number</h1>
+  <p>
+    Alerts call <strong>{{ masked_phone }}</strong>.
+    {% if required %}
+      Confirm that the number is yours before any alert can call it.
+    {% endif %}
+  </p>
+
+  <div class="row g-4">
+    <div class="col-md-6">
+      <div class="card">
+        <div class="card-body">
+          <h2 class="h5">1. Get a code</h2>
+          <p class="text-muted mb-3">
+            {% if dry_run %}
+              Dry-run mode: no SMS is sent. The code is written to the server log.
+            {% else %}
+              We send a one-time code by SMS. It is valid for 10 minutes.
+            {% endif %}
+          </p>
+          <form method="post" action="{{ url_for('verify.send_code') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-outline-primary">Send code</button>
+          </form>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="card">
+        <div class="card-body">
+          <h2 class="h5">2. Enter it</h2>
+          <form method="post" action="{{ url_for('verify.check_code') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="mb-3">
+              <label for="code" class="form-label">Code</label>
+              <input type="text" name="code" id="code" class="form-control"
+                     inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{4,12}" required>
+            </div>
+            <button type="submit" class="btn btn-primary">Verify</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="mt-4">
+    Wrong number? <a href="{{ url_for('settings.index') }}">Change it in Settings</a>.
+  </p>
+{% endblock %}

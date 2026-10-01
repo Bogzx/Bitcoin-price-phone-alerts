@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+
+{% block content %}
+  <h1>Settings</h1>
+  <p class="text-muted">Every change asks for your current password.</p>
+
+  <div class="row g-4">
+    <div class="col-lg-6">
+      <div class="card h-100">
+        <div class="card-body">
+          <h2 class="h5">Phone number</h2>
+          <p>
+            Alerts call <strong>{{ masked_phone }}</strong>
+            {% if current_user.phone_verified %}
+              <span class="badge bg-success">verified</span>
+            {% elif verification_required %}
+              <span class="badge bg-warning text-dark">not verified</span>
+              (<a href="{{ url_for('verify.verify_phone') }}">verify</a>)
+            {% endif %}
+          </p>
+          <form method="post" action="{{ url_for('settings.change_phone') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="mb-3">
+              <label for="phone_number" class="form-label">New number</label>
+              <input type="tel" name="phone_number" id="phone_number" class="form-control"
+                     placeholder="+14155550123" pattern="\+[1-9][0-9 ]{7,18}" required>
+              {% if verification_required %}
+                <div class="form-text">You will confirm the new number with a code.</div>
+              {% endif %}
+            </div>
+            <div class="mb-3">
+              <label for="phone_current_password" class="form-label">Current password</label>
+              <input type="password" name="current_password" id="phone_current_password"
+                     class="form-control" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn btn-primary">Change number</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-lg-6">
+      <div class="card h-100">
+        <div class="card-body">
+          <h2 class="h5">Password</h2>
+          <form method="post" action="{{ url_for('settings.change_password') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="mb-3">
+              <label for="pw_current_password" class="form-label">Current password</label>
+              <input type="password" name="current_password" id="pw_current_password"
+                     class="form-control" autocomplete="current-password" required>
+            </div>
+            <div class="mb-3">
+              <label for="new_password" class="form-label">New password</label>
+              <input type="password" name="new_password" id="new_password" class="form-control"
+                     minlength="{{ min_password_length }}" autocomplete="new-password" required>
+            </div>
+            <div class="mb-3">
+              <label for="confirm_password" class="form-label">Repeat new password</label>
+              <input type="password" name="confirm_password" id="confirm_password"
+                     class="form-control" autocomplete="new-password" required>
+            </div>
+            <button type="submit" class="btn btn-primary">Change password</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card border-danger mt-4">
+    <div class="card-body">
+      <h2 class="h5 text-danger">Delete account</h2>
+      <p>Deletes your account and all its alerts. This cannot be undone.</p>
+      <form method="post" action="{{ url_for('settings.delete_account') }}" class="row g-2 align-items-end">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="col-sm-6">
+          <label for="delete_current_password" class="form-label">Current password</label>
+          <input type="password" name="current_password" id="delete_current_password"
+                 class="form-control" autocomplete="current-password" required>
+        </div>
+        <div class="col-sm-6">
+          <button type="submit" class="btn btn-danger">Delete my account</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}

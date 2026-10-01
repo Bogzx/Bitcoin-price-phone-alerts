@@ -1,12 +1,44 @@
-import os
-import sys
+import pytest
 
-# The Binance feed starts at import time in app.py; tests must never open it.
-os.environ["RUN_PRICE_FEED"] = "0"
-os.environ.setdefault("SECRET_KEY", "test-secret-key")
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-os.environ.setdefault("TWILIO_ACCOUNT_SID", "ACtest")
-os.environ.setdefault("TWILIO_AUTH_TOKEN", "test-token")
-os.environ.setdefault("TWILIO_PHONE_NUMBER", "+15005550006")
+from btc_alerts import create_app, get_services
+from btc_alerts.models import db
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# create_app() never starts the Binance feed; only app.py does. These settings
+# keep the tests off the network, off Twilio and independent of the local .env.
+TEST_CONFIG = {
+    "TESTING": True,
+    "SECRET_KEY": "test-secret-key",
+    "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+    "TWILIO_ACCOUNT_SID": "ACtest",
+    "TWILIO_AUTH_TOKEN": "test-token",
+    "TWILIO_PHONE_NUMBER": "+15005550006",
+    "NOTIFY_DRY_RUN": False,
+    "RUN_PRICE_FEED": False,
+    "WTF_CSRF_ENABLED": False,
+    "RATELIMIT_ENABLED": False,
+    "SESSION_COOKIE_SECURE": False,
+    "REMEMBER_COOKIE_SECURE": False,
+    "ALLOW_REGISTRATION": False,
+    "LOG_LEVEL": "INFO",
+}
+
+
+@pytest.fixture
+def make_app():
+    """Builds an app from TEST_CONFIG plus overrides (for non-default setups)."""
+    return lambda **overrides: create_app({**TEST_CONFIG, **overrides})
+
+
+@pytest.fixture
+def app(make_app):
+    """A fresh app with an empty in-memory database, inside an app context."""
+    app = make_app()
+    with app.app_context():
+        yield app
+        db.session.remove()
+        db.drop_all()
+
+
+@pytest.fixture
+def services(app):
+    return get_services(app)

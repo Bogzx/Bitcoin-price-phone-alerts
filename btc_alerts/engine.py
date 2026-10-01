@@ -16,7 +16,7 @@ import threading
 import time
 
 from sqlalchemy import event
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, contains_eager
 
 from .extensions import socketio
 from .models import Alert, NotificationLog, User, db, utcnow
@@ -173,11 +173,21 @@ class AlertEngine:
         return pending
 
     def _active_alerts(self):
-        """Untriggered alerts that may fire: with phone verification required,
-        only those of users who verified their number."""
-        query = Alert.query.filter_by(triggered=False)
+        """Untriggered alerts that may fire, each with its user from the same row.
+
+        With phone verification required, only users whose verified number is
+        their current number. The user is loaded in this query (not lazily
+        later), so the number a job goes to is the one this filter checked: a
+        number change committed after the query cannot redirect the call.
+        """
+        query = (
+            Alert.query.filter_by(triggered=False)
+            .join(Alert.user)
+            .options(contains_eager(Alert.user))
+            .populate_existing()
+        )
         if verification_required(self.app):
-            query = query.join(User).filter(
+            query = query.filter(
                 User.phone_verified_at.isnot(None),
                 User.phone_verified_number == User.phone_number,
             )
@@ -194,8 +204,10 @@ class AlertEngine:
         return alert.is_due(price, repeat_cooldown, now)
 
     def _may_notify(self, alert, now, budget):
-        """Applies the per-user cooldown and the global daily budget."""
+        """Applies phone verification, the per-user cooldown and the daily budget."""
         user = alert.user
+        if verification_required(self.app) and not user.phone_verified:
+            return False
         cooldown = self.app.config["NOTIFY_COOLDOWN_SECONDS"]
         if user.notification_cooldown_active(cooldown, now):
             self.app.logger.info(
@@ -237,7 +249,14 @@ class AlertEngine:
             "log": log_entry,
             "alert_id": alert.id,
             "user_id": user.id,
-            "phone_number": user.phone_number,
+            # The verified number when verification is required: the number this
+            # user proved they own, not whatever the row says by the time the
+            # worker runs.
+            "phone_number": (
+                user.phone_verified_number
+                if verification_required(self.app)
+                else user.phone_number
+            ),
             "channel": alert.notify_channel,
             "message": message,
             "repeat": alert.repeat,

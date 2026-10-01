@@ -223,3 +223,58 @@ def test_parallel_sends_respect_the_deployment_cap(race):
 
     assert len(race.verify.sent) == 2
     assert in_db(race.app, lambda: PhoneVerification.query.count()) == 2
+
+
+def test_number_change_between_the_alert_query_and_the_send(make_app, tmp_path, monkeypatch):
+    """The engine selects alerts of verified users, then builds the job. A number
+    change committed in between (hooked right after the query, from another
+    connection) must not redirect the call to the new, unverified number."""
+    from sqlalchemy import text
+
+    from btc_alerts.engine import AlertEngine
+
+    app = make_app(
+        SQLALCHEMY_DATABASE_URI=f"sqlite:///{tmp_path / 'gap.db'}",
+        REQUIRE_PHONE_VERIFICATION=True,
+        NOTIFY_DRY_RUN=True,
+        NOTIFY_COOLDOWN_SECONDS=0,
+    )
+    services = get_services(app)
+    calls = []
+    monkeypatch.setattr(services.notifier, "call_user",
+                        lambda number, message: calls.append(number))
+
+    def verified_user_with_alert():
+        user = User(username="gap", email="gap@example.com", phone_number=PHONE)
+        user.set_password(PASSWORD)
+        user.mark_phone_verified()
+        db.session.add(user)
+        db.session.flush()
+        db.session.add(Alert(price_threshold=69000.0, alert_type="above", user_id=user.id))
+        db.session.commit()
+        return user.id
+
+    user_id = in_db(app, verified_user_with_alert)
+    evaluate = AlertEngine._evaluate
+    changed = []
+
+    def change_number_then_evaluate(alert, *args):
+        if not changed:  # another session commits a number change in the gap
+            with db.engine.begin() as conn:
+                conn.execute(
+                    text('UPDATE "user" SET phone_number = :phone, phone_verified_at = NULL, '
+                         "phone_verified_number = NULL WHERE id = :id"),
+                    {"phone": OTHER_PHONE, "id": user_id},
+                )
+            changed.append(True)
+        return evaluate(alert, *args)
+
+    monkeypatch.setattr(AlertEngine, "_evaluate", staticmethod(change_number_then_evaluate))
+    services.feed.on_message(None, json.dumps({"e": "trade", "p": "70000"}))
+    services.notifier.drain(retry_delay=0)
+
+    assert changed == [True]
+    assert in_db(app, lambda: User.query.one().phone_number) == OTHER_PHONE
+    # The alert was due for the number verified when it was selected; the new,
+    # unverified number is never called.
+    assert calls == [PHONE]

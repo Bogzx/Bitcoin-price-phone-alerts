@@ -71,7 +71,11 @@
   <div class="card border-danger mt-4">
     <div class="card-body">
       <h2 class="h5 text-danger">Delete account</h2>
-      <p>Deletes your account and all its alerts. This cannot be undone.</p>
+      <p>
+        Deletes your account and all its alerts. This cannot be undone. Registration does
+        not reopen afterwards: to create a new account on this deployment, the owner has to
+        set <code>ALLOW_REGISTRATION=true</code>.
+      </p>
       <form method="post" action="{{ url_for('settings.delete_account') }}" class="row g-2 align-items-end">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="col-sm-6">

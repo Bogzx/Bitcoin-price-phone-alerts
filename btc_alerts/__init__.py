@@ -14,7 +14,7 @@ from .alerts import bp as alerts_bp
 from .auth import bp as auth_bp
 from .config import load_config
 from .extensions import csrf, limiter, login_manager, socketio
-from .models import add_missing_columns, db
+from .models import db, upgrade_database
 from .services import build_services, get_services, start_background_services
 from .settings import bp as settings_bp
 from .verification import bp as verify_bp, verification_required
@@ -58,10 +58,10 @@ def create_app(overrides=None):
     app.register_blueprint(settings_bp)
     _warn_about_unsafe_verification_settings(app)
 
-    # Create missing tables and add columns an older database lacks.
+    # Create missing tables and bring an older database up to date.
     with app.app_context():
         db.create_all()
-        add_missing_columns(db.engine, app.logger)
+        upgrade_database(db.engine, app.logger)
 
     app.extensions["btc_alerts"] = build_services(app)
     return app

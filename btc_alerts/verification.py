@@ -27,6 +27,7 @@ from flask import (
 )
 from flask_login import current_user, login_required
 
+from .config import phone_verification_required
 from .extensions import limiter
 from .models import PhoneVerification, db, utcnow
 from .notifications import mask_phone
@@ -46,9 +47,7 @@ class VerificationError(Exception):
 
 
 def verification_required(app=None):
-    config = (app or current_app).config
-    required = config["REQUIRE_PHONE_VERIFICATION"]
-    return config["ALLOW_REGISTRATION"] if required is None else bool(required)
+    return phone_verification_required((app or current_app).config)
 
 
 class PhoneVerifier:
@@ -79,14 +78,25 @@ class PhoneVerifier:
     def send(self, user):
         """Sends a new code to the user's current number. Raises VerificationError."""
         now = utcnow()
-        sent_last_hour = PhoneVerification.query.filter(
-            PhoneVerification.user_id == user.id,
-            PhoneVerification.created_at >= now - timedelta(hours=1),
-        ).count()
+        last_hour = PhoneVerification.query.filter(
+            PhoneVerification.created_at >= now - timedelta(hours=1)
+        )
         limit = self.config["VERIFY_MAX_SENDS_PER_HOUR"]
-        if sent_last_hour >= limit:
+        if last_hour.filter(PhoneVerification.user_id == user.id).count() >= limit:
             raise VerificationError(
                 f"You have requested {limit} codes in the last hour. Please wait and try again."
+            )
+        # Each code is an SMS on the owner's Twilio balance, so many accounts each
+        # staying under their own limit must not add up to an unbounded bill.
+        total_limit = self.config["VERIFY_MAX_SENDS_PER_HOUR_TOTAL"]
+        if total_limit > 0 and last_hour.count() >= total_limit:
+            self.app.logger.warning(
+                f"VERIFY_MAX_SENDS_PER_HOUR_TOTAL ({total_limit}) reached; refusing to send "
+                f"a code to {mask_phone(user.phone_number)}."
+            )
+            raise VerificationError(
+                "This deployment has sent too many verification codes in the last hour. "
+                "Please try again later."
             )
 
         code_hash = None
@@ -143,12 +153,20 @@ class PhoneVerifier:
             pending.status = "expired"
             db.session.commit()
             raise VerificationError("That code has expired. Send a new one.")
-        if pending.attempts >= self.config["VERIFY_MAX_ATTEMPTS"]:
-            raise VerificationError("Too many wrong codes. Send a new one.")
-
-        # Counted (and committed) before checking, so parallel guesses still count.
-        pending.attempts += 1
+        # Claim an attempt with one conditional UPDATE before checking the code, so
+        # parallel guesses cannot both pass a stale "attempts < max" check.
+        claimed = (
+            PhoneVerification.query.filter(
+                PhoneVerification.id == pending.id,
+                PhoneVerification.attempts < self.config["VERIFY_MAX_ATTEMPTS"],
+            ).update(
+                {PhoneVerification.attempts: PhoneVerification.attempts + 1},
+                synchronize_session=False,
+            )
+        )
         db.session.commit()
+        if not claimed:
+            raise VerificationError("Too many wrong codes. Send a new one.")
 
         code = re.sub(r"\s", "", code or "")
         if not CODE_RE.match(code):

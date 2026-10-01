@@ -5,10 +5,10 @@ not be able to point the alerts at another number or lock the owner out.
 """
 
 from flask import Blueprint, current_app, flash, redirect, render_template, request, url_for
-from flask_login import current_user, login_required, logout_user
+from flask_login import current_user, login_required, login_user, logout_user
 
 from .extensions import limiter
-from .models import Alert, PhoneVerification, User, db
+from .models import DELETED_USER_ID, Alert, NotificationLog, PhoneVerification, User, db
 from .notifications import mask_phone
 from .validation import MIN_PASSWORD_LENGTH, normalize_phone_number
 from .verification import get_verifier, verification_required
@@ -79,9 +79,15 @@ def change_password():
     if new_password != request.form.get("confirm_password", ""):
         flash("The two new passwords do not match.", "danger")
         return redirect(url_for("settings.index"))
-    current_user.set_password(new_password)
+    user = current_user._get_current_object()
+    user.set_password(new_password)
+    # A new token signs out every other session and remember-me cookie; this
+    # session is logged in again with it.
+    user.rotate_session_token()
     db.session.commit()
-    flash("Password changed.", "success")
+    remember_cookie = current_app.config.get("REMEMBER_COOKIE_NAME", "remember_token")
+    login_user(user, remember=remember_cookie in request.cookies)
+    flash("Password changed. Other devices have been signed out.", "success")
     return redirect(url_for("settings.index"))
 
 
@@ -92,10 +98,15 @@ def delete_account():
     if not _password_ok():
         return redirect(url_for("settings.index"))
     user = db.session.get(User, current_user.id)
-    # The notification log is kept: it is the ledger for MAX_NOTIFICATIONS_PER_DAY
-    # and holds no phone number, only the user id and the message text.
     Alert.query.filter_by(user_id=user.id).delete()
-    PhoneVerification.query.filter_by(user_id=user.id).delete()
+    # Notification log rows and sent codes are the ledgers for the deployment-wide
+    # caps (MAX_NOTIFICATIONS_PER_DAY, VERIFY_MAX_SENDS_PER_HOUR_TOTAL), so they
+    # are kept but detached: they belong to no account and hold no phone number.
+    NotificationLog.query.filter_by(user_id=user.id).update({"user_id": DELETED_USER_ID})
+    PhoneVerification.query.filter_by(user_id=user.id).update(
+        {"user_id": DELETED_USER_ID, "phone_number": "", "code_hash": None,
+         "status": "superseded"}
+    )
     logout_user()
     db.session.delete(user)
     db.session.commit()

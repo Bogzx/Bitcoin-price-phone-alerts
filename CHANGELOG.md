@@ -12,8 +12,23 @@
     per-IP rate limits.
   - Local codes are stored as an HMAC keyed by `SECRET_KEY`.
 - **Account settings** (`/settings`): change the phone number (which resets
-  verification), change the password, delete the account. Every change needs the
-  current password and is rate-limited.
+  verification), change the password (which signs out other devices), delete the
+  account. Every change needs the current password and is rate-limited.
+- **Session tokens:** sessions and remember-me cookies identify the user by a random
+  per-user token instead of the id, and user ids use SQLite AUTOINCREMENT. Before this,
+  a deleted account's id went to the next registration, and the deleted user's other
+  sessions opened that new account. Old databases get tokens and an AUTOINCREMENT
+  `user` table on startup, with the id sequence above every id still referenced. Users
+  are signed out once by the upgrade.
+- **Registration never reopens by itself:** the deployment records that it had an owner,
+  so deleting every account with `ALLOW_REGISTRATION=false` no longer hands it to the
+  next visitor.
+- `VERIFY_MAX_SENDS_PER_HOUR_TOTAL` (default 20) caps verification SMS for the whole
+  deployment. Deleting an account keeps its notification log and sent-code rows,
+  detached from any account (the code rows lose their phone numbers), so deleting and
+  re-registering cannot reset the caps.
+- A notification replayed after a restart is skipped when the user's current number is
+  not verified.
 - **Quiet band:** trade ticks that cannot change any alert skip the database (about
   2 ms → 0.02 ms per tick with 5 alerts). `ALERT_FULL_SCAN_SECONDS` bounds how long.
 - `scripts/bench_ticks.py`, and the `docs/` screenshots taken from a dry-run instance.

@@ -3,7 +3,15 @@ loses its verification, and deleting the account removes its alerts."""
 
 import pytest
 
-from btc_alerts.models import Alert, NotificationLog, PhoneVerification, User, db, utcnow
+from btc_alerts.models import (
+    DELETED_USER_ID,
+    Alert,
+    NotificationLog,
+    PhoneVerification,
+    User,
+    db,
+    utcnow,
+)
 
 PASSWORD = "correct-horse"
 
@@ -22,7 +30,7 @@ def user(app):
 def client(app, user):
     with app.test_client() as client:
         with client.session_transaction() as session:
-            session["_user_id"] = str(user.id)
+            session["_user_id"] = user.get_id()
             session["_fresh"] = True
         yield client
 
@@ -100,7 +108,7 @@ def test_delete_needs_the_password(client, user):
     assert db.session.get(User, user.id) is not None
 
 
-def test_delete_removes_the_account_and_its_alerts_but_keeps_the_budget_ledger(client, user):
+def test_delete_removes_the_account_and_alerts_and_detaches_the_ledgers(client, user):
     user_id = user.id
     db.session.add(Alert(price_threshold=80000.0, alert_type="above", user_id=user_id))
     db.session.add(PhoneVerification(user_id=user_id, phone_number=user.phone_number,
@@ -115,8 +123,11 @@ def test_delete_removes_the_account_and_its_alerts_but_keeps_the_budget_ledger(c
     db.session.expire_all()
     assert db.session.get(User, user_id) is None
     assert Alert.query.count() == 0
-    assert PhoneVerification.query.count() == 0
-    assert NotificationLog.query.count() == 1  # counts toward MAX_NOTIFICATIONS_PER_DAY
+    # Both ledgers keep counting toward the deployment-wide caps, but belong to no
+    # account any more, and the sent code no longer records the phone number.
+    code = PhoneVerification.query.one()
+    assert (code.user_id, code.phone_number, code.code_hash) == (DELETED_USER_ID, "", None)
+    assert NotificationLog.query.one().user_id == DELETED_USER_ID
     assert client.get("/").status_code == 302  # logged out
 
 
@@ -134,7 +145,7 @@ def test_settings_posts_are_rate_limited(make_app):
         db.session.add(owner)
         db.session.commit()
         with client.session_transaction() as session:
-            session["_user_id"] = str(owner.id)
+            session["_user_id"] = owner.get_id()
         statuses = [
             client.post("/settings/password", data={"current_password": "guess"}).status_code
             for _ in range(5)

@@ -30,7 +30,7 @@ def make_user(client):
     db.session.add(user)
     db.session.commit()
     with client.session_transaction() as session:
-        session["_user_id"] = str(user.id)
+        session["_user_id"] = user.get_id()
         session["_fresh"] = True
     return user
 

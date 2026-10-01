@@ -39,7 +39,7 @@ def user(verified_app):
 def client(verified_app, user):
     with verified_app.test_client() as client:
         with client.session_transaction() as session:
-            session["_user_id"] = str(user.id)
+            session["_user_id"] = user.get_id()
             session["_fresh"] = True
         yield client
 
@@ -289,5 +289,5 @@ def test_owner_only_default_needs_no_verification(app, services):
     db.session.commit()
     with app.test_client() as client:
         with client.session_transaction() as session:
-            session["_user_id"] = str(owner.id)
+            session["_user_id"] = owner.get_id()
         assert client.get("/").status_code == 200

@@ -93,11 +93,16 @@ flowchart LR
 Every alert is a call you pay for, to a number someone typed. The defaults are built
 around that:
 
-- **Registration closes after the first account** unless `ALLOW_REGISTRATION=true`.
+- **Registration closes after the first account** unless `ALLOW_REGISTRATION=true`, and
+  stays closed even if every account is later deleted: the deployment remembers that it
+  had an owner.
 - **Phone verification.** `REQUIRE_PHONE_VERIFICATION` is on by default whenever
   registration is open. Unverified users are sent to the verification page, cannot
   create alerts, and their alerts never fire. Users can request at most 3 codes per hour
-  and get 5 guesses per code. Codes expire after 10 minutes.
+  (20 for the whole deployment) and get 5 guesses per code. Codes expire after 10 minutes.
+- **Sessions are tied to the account, not its id.** Sessions and remember-me cookies carry
+  a random per-user token that changes with every password change (signing out other
+  devices) and dies with the account; user ids are never reused.
 - **Caps:** 5 active alerts per user, one notification per user per 5 minutes, and 50
   calls and SMS per rolling 24 hours for the whole deployment (a "both" alert counts as 2).
 - **Phone numbers must be E.164**, with an optional country-code allowlist
@@ -146,6 +151,7 @@ All settings are environment variables (or `.env` lines).
 | `REQUIRE_PHONE_VERIFICATION` | Users must confirm their number with an SMS code | same as `ALLOW_REGISTRATION` |
 | `TWILIO_VERIFY_SERVICE_SID` | Twilio Verify service that sends and checks the codes | none |
 | `VERIFY_MAX_SENDS_PER_HOUR` / `VERIFY_MAX_ATTEMPTS` | Codes per user per hour / guesses per code | `3` / `5` |
+| `VERIFY_MAX_SENDS_PER_HOUR_TOTAL` | Codes the whole deployment may send per hour (0 = no cap) | `20` |
 | `VERIFY_CODE_TTL_SECONDS` | Lifetime of a dry-run code (Twilio Verify uses its own, 10 min by default) | `600` |
 | `MAX_ACTIVE_ALERTS_PER_USER` | Cap on untriggered alerts per account | `5` |
 | `NOTIFY_COOLDOWN_SECONDS` | Minimum seconds between two notifications for one user | `300` |

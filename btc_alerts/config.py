@@ -98,6 +98,9 @@ def load_config(env=None):
         "TWILIO_VERIFY_SERVICE_SID": env.get("TWILIO_VERIFY_SERVICE_SID"),
         # Codes a user may request per rolling hour, and wrong guesses per code.
         "VERIFY_MAX_SENDS_PER_HOUR": _env_int(env, "VERIFY_MAX_SENDS_PER_HOUR", 3),
+        # Codes the whole deployment may send per rolling hour, across all users:
+        # each one is an SMS on the owner's Twilio balance.
+        "VERIFY_MAX_SENDS_PER_HOUR_TOTAL": _env_int(env, "VERIFY_MAX_SENDS_PER_HOUR_TOTAL", 20),
         "VERIFY_MAX_ATTEMPTS": _env_int(env, "VERIFY_MAX_ATTEMPTS", 5),
         # Lifetime of a code (Twilio Verify's default is also 10 minutes).
         "VERIFY_CODE_TTL_SECONDS": _env_int(env, "VERIFY_CODE_TTL_SECONDS", 600),
@@ -145,3 +148,9 @@ def load_config(env=None):
         "VERIFY_SEND_RATE_LIMIT": env.get("VERIFY_SEND_RATE_LIMIT", "5 per hour"),
         "VERIFY_CHECK_RATE_LIMIT": env.get("VERIFY_CHECK_RATE_LIMIT", "10 per minute"),
     }
+
+
+def phone_verification_required(config):
+    """REQUIRE_PHONE_VERIFICATION, which follows ALLOW_REGISTRATION when unset."""
+    required = config["REQUIRE_PHONE_VERIFICATION"]
+    return config["ALLOW_REGISTRATION"] if required is None else bool(required)

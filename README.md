@@ -93,8 +93,6 @@ Before exposing it to the internet you would need, at minimum:
   `threading` mode, so do not use the eventlet/gevent worker classes. Extra workers will not run the feed (the lock prevents duplicate
   calls) but they will not see live prices either. Multi-worker support needs a Redis
   message queue and a shared price cache.
-- **Every alert is re-evaluated on every trade tick** with a full table scan. Fine for a
-  handful of users, not for many.
 - No real migration tool. On SQLite, missing tables are created and missing columns
   are added automatically at startup (additive only), so an `alerts.db` from an older
   version keeps working. On other databases, add new columns by hand or adopt
@@ -232,7 +230,8 @@ no credentials. CI runs them on Python 3.10, 3.12 and 3.14.
 | `REPEAT_ALERT_COOLDOWN_SECONDS` | Minimum seconds before a repeating alert fires again | `900` |
 | `ALLOWED_PHONE_COUNTRY_CODES` | Optional E.164 country code allowlist, e.g. `1,44,40` | empty (any) |
 | `RUN_PRICE_FEED` | Whether this process may run the Binance feed | `true` |
-| `PRICE_FEED_LOCK_PORT` | Localhost port used as the single-owner lock for the feed | `47653` |
+| `ALERT_FULL_SCAN_SECONDS` | Longest time trade ticks may skip the database while no alert can fire (see How It Works) | `5` |
+| `PRICE_FEED_LOCK_PORT` | Localhost port used as the single-owner lock for the feed | `29653` |
 | `CORS_ALLOWED_ORIGINS` | Comma separated Socket.IO origins | `http://localhost:5000,http://127.0.0.1:5000` |
 | `LOGIN_RATE_LIMIT` | Flask-Limiter expression for `POST /login` | `10 per minute; 60 per hour` |
 | `REGISTER_RATE_LIMIT` | Flask-Limiter expression for `POST /register` | `5 per hour` |
@@ -267,6 +266,11 @@ a dead feed means no alert can fire, and nothing else would tell you.
 - Bitcoin prices are obtained from Binance's WebSocket API in real-time. The socket
   pings every 20s, a watchdog recycles it after `FEED_STALE_SECONDS` of silence, and
   reconnects back off exponentially (1s to 60s) while Binance is unreachable
+- Each trade is checked against a cached "quiet band", the price range in which no
+  alert can fire or re-arm. Ticks inside it skip the database (about 0.02 ms instead of
+  2 ms per tick with 5 alerts; `python scripts/bench_ticks.py`). The band is dropped
+  whenever an alert or user changes, and alerts are re-read at least every
+  `ALERT_FULL_SCAN_SECONDS` anyway
 - When a price threshold is crossed, the alert state is committed first
 - The Twilio call or SMS is then dispatched by a background worker, which retries and
   records the error on the alert if delivery fails
@@ -280,16 +284,27 @@ feed rather than placing duplicate calls.
 
 ```
 Bitcoin-price-phone-alerts/
-├── app.py               # Main application entry point
-├── config.py            # Configuration settings
-├── models.py            # Database models
-├── requirements.txt     # Python dependencies (requirements-dev.txt adds pytest, ruff)
-├── Dockerfile           # Single-worker gunicorn image with /healthz HEALTHCHECK
-├── .env.example         # Example environment variables
-├── static/              # Static assets (CSS, JS)
-├── templates/           # HTML templates
-└── tests/               # Pytest suite (fake Twilio client, fake Binance socket)
+├── app.py                 # Entry point: loads .env, create_app(), starts the feed
+├── btc_alerts/
+│   ├── __init__.py        # create_app(): config, extensions, blueprints, services
+│   ├── config.py          # Settings read from the environment
+│   ├── models.py          # User, Alert, NotificationLog; additive SQLite upgrades
+│   ├── feed.py            # Binance socket, reconnect backoff, watchdog, feed lock
+│   ├── engine.py          # Tick evaluation, quiet band, cooldowns, daily budget
+│   ├── notifications.py   # Twilio calls/SMS, retrying worker, restart recovery
+│   ├── services.py        # Wires feed -> engine -> notifier; starts the threads
+│   ├── auth.py, alerts.py # Blueprints: register/login/logout; dashboard, alerts, /healthz
+│   ├── events.py          # Socket.IO connect handler (per-user rooms)
+│   ├── templates/, static/
+├── scripts/bench_ticks.py # Per-tick cost with and without the quiet band
+├── tests/                 # Pytest suite (fake Twilio client, fake Binance socket)
+├── Dockerfile             # Single-worker gunicorn image with /healthz HEALTHCHECK
+└── requirements.txt       # Runtime dependencies (requirements-dev.txt adds pytest, ruff)
 ```
+
+Importing `btc_alerts` starts nothing. `create_app()` builds an app, and only the entry
+point (`app.py`, used by gunicorn and `python app.py`) starts the Binance feed and the
+notification worker.
 
 ## 📄 License
 

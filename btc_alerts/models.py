@@ -24,7 +24,14 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     # Timestamp of the last outbound call/SMS, used for the per-user cooldown.
     last_notified_at = db.Column(db.DateTime, nullable=True)
+    # When the user proved they own phone_number with a one-time code. Cleared
+    # whenever the number changes.
+    phone_verified_at = db.Column(db.DateTime, nullable=True)
     alerts = db.relationship('Alert', backref='user', lazy=True)
+
+    @property
+    def phone_verified(self):
+        return self.phone_verified_at is not None
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -131,6 +138,22 @@ class NotificationLog(db.Model):
     # the call went out and only the SMS was still being retried.
     delivered = db.Column(db.String(20), nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+
+
+class PhoneVerification(db.Model):
+    """One verification code sent to a user's phone, and what became of it."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    # The number the code went to: a code proves ownership of this number only.
+    phone_number = db.Column(db.String(20), nullable=False)
+    # HMAC of a locally generated code (dry-run mode). Twilio Verify keeps its own
+    # codes, so this is empty for codes sent through it.
+    code_hash = db.Column(db.String(64), nullable=True)
+    # "pending", "approved", "superseded" (a newer code was sent) or "expired".
+    status = db.Column(db.String(12), nullable=False, default="pending")
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False)
 
 
 def add_missing_columns(engine, logger=None):

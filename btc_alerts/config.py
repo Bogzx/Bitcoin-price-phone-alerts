@@ -85,6 +85,22 @@ def load_config(env=None):
         # A fired repeating alert re-arms only after the price moves this percent of
         # the threshold back out of the trigger zone (0.25% of $100k = $250).
         "REARM_HYSTERESIS_PERCENT": _env_float(env, "REARM_HYSTERESIS_PERCENT", 0.25),
+        # Users must confirm their phone number with a one-time SMS code before
+        # alerts can call it. Unset means "on whenever ALLOW_REGISTRATION is on":
+        # strangers are the risk, the owner's own number is not.
+        "REQUIRE_PHONE_VERIFICATION": (
+            _env_bool(env, "REQUIRE_PHONE_VERIFICATION", False)
+            if (env.get("REQUIRE_PHONE_VERIFICATION") or "").strip()
+            else None
+        ),
+        # Twilio Verify service that sends and checks the codes (Console > Verify >
+        # Services). Not needed with NOTIFY_DRY_RUN, where codes are logged instead.
+        "TWILIO_VERIFY_SERVICE_SID": env.get("TWILIO_VERIFY_SERVICE_SID"),
+        # Codes a user may request per rolling hour, and wrong guesses per code.
+        "VERIFY_MAX_SENDS_PER_HOUR": _env_int(env, "VERIFY_MAX_SENDS_PER_HOUR", 3),
+        "VERIFY_MAX_ATTEMPTS": _env_int(env, "VERIFY_MAX_ATTEMPTS", 5),
+        # Lifetime of a code (Twilio Verify's default is also 10 minutes).
+        "VERIFY_CODE_TTL_SECONDS": _env_int(env, "VERIFY_CODE_TTL_SECONDS", 600),
         # Optional allowlist of E.164 country calling codes, e.g. "1,44,40".
         # Empty means "any country", which is the widest toll-fraud surface.
         "ALLOWED_PHONE_COUNTRY_CODES": _env_list(env, "ALLOWED_PHONE_COUNTRY_CODES"),
@@ -125,4 +141,7 @@ def load_config(env=None):
         "RATELIMIT_ENABLED": _env_bool(env, "RATELIMIT_ENABLED", True),
         "LOGIN_RATE_LIMIT": env.get("LOGIN_RATE_LIMIT", "10 per minute; 60 per hour"),
         "REGISTER_RATE_LIMIT": env.get("REGISTER_RATE_LIMIT", "5 per hour"),
+        # Per IP, on top of the per-user limits above.
+        "VERIFY_SEND_RATE_LIMIT": env.get("VERIFY_SEND_RATE_LIMIT", "5 per hour"),
+        "VERIFY_CHECK_RATE_LIMIT": env.get("VERIFY_CHECK_RATE_LIMIT", "10 per minute"),
     }

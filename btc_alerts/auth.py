@@ -8,6 +8,7 @@ from flask_login import current_user, login_required, login_user, logout_user
 from .extensions import limiter, login_manager
 from .models import User, db
 from .validation import MIN_PASSWORD_LENGTH, normalize_phone_number
+from .verification import verification_required
 
 bp = Blueprint("auth", __name__)
 
@@ -33,8 +34,9 @@ def _registration_closed():
 def registration_open():
     """Registration is for the owner's first account unless explicitly opened.
 
-    Phone numbers are not verified, so each extra account is someone who can
-    make this deployment call any number on the owner's Twilio balance.
+    Each extra account can make this deployment call phone numbers on the
+    owner's Twilio balance, which is why opening it turns on phone verification
+    by default (REQUIRE_PHONE_VERIFICATION).
     """
     if current_app.config["ALLOW_REGISTRATION"]:
         return True
@@ -43,7 +45,10 @@ def registration_open():
 
 @bp.app_context_processor
 def inject_registration_open():
-    return {"registration_open": registration_open}
+    return {
+        "registration_open": registration_open,
+        "phone_verification_required": verification_required,
+    }
 
 
 @bp.route("/register", methods=["GET", "POST"])
@@ -66,8 +71,8 @@ def register():
             flash(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", "danger")
             return redirect(url_for("auth.register"))
 
-        # The phone number is whatever the registrant types and is never verified,
-        # so at minimum it has to be a plausible E.164 number.
+        # At minimum a plausible E.164 number. Ownership is checked with a code
+        # after login when REQUIRE_PHONE_VERIFICATION is on.
         phone_number, error = normalize_phone_number(request.form.get("phone_number"))
         if error:
             flash(error, "danger")

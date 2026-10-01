@@ -10,6 +10,7 @@ from .engine import AlertEngine
 from .extensions import socketio
 from .feed import FeedLockUnavailable, PriceFeed, acquire_feed_lock, ephemeral_port_range
 from .notifications import Notifier
+from .verification import PhoneVerifier
 
 
 @dataclass
@@ -17,6 +18,7 @@ class Services:
     notifier: Notifier
     engine: AlertEngine
     feed: PriceFeed
+    verifier: PhoneVerifier
     feed_lock: Optional[Any] = None
 
 
@@ -24,7 +26,8 @@ def build_services(app):
     notifier = Notifier(app)
     engine = AlertEngine(app, notifier)
     feed = PriceFeed(app, on_price=engine.process_tick)
-    return Services(notifier=notifier, engine=engine, feed=feed)
+    verifier = PhoneVerifier(app, notifier)
+    return Services(notifier=notifier, engine=engine, feed=feed, verifier=verifier)
 
 
 def get_services(app=None):

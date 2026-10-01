@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from .extensions import socketio
 from .models import Alert, NotificationLog, User, db, utcnow
 from .notifications import notification_cost, notifications_in_last_day
+from .verification import verification_required
 
 # Bumped after every flush that touches an Alert or a User, from any thread.
 # A quiet band computed before the latest bump is stale.
@@ -140,7 +141,7 @@ class AlertEngine:
         band = QuietBand(version, hysteresis, started)
         pending = []
         changed = False
-        for alert in Alert.query.filter_by(triggered=False).all():
+        for alert in self._active_alerts():
             due = self._evaluate(alert, price, now, hysteresis, repeat_cooldown)
             if due is None:
                 changed = True  # re-armed
@@ -170,6 +171,17 @@ class AlertEngine:
             )
             self.notifier.queue.put(job)
         return pending
+
+    def _active_alerts(self):
+        """Untriggered alerts that may fire: with phone verification required,
+        only those of users who verified their number."""
+        query = Alert.query.filter_by(triggered=False)
+        if verification_required(self.app):
+            query = query.join(User).filter(
+                User.phone_verified_at.isnot(None),
+                User.phone_verified_number == User.phone_number,
+            )
+        return query.all()
 
     @staticmethod
     def _evaluate(alert, price, now, hysteresis, repeat_cooldown):

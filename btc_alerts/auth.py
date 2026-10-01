@@ -6,8 +6,9 @@ from flask import Blueprint, current_app, flash, redirect, render_template, requ
 from flask_login import current_user, login_required, login_user, logout_user
 
 from .extensions import limiter, login_manager
-from .models import User, db
+from .models import User, db, instance_bootstrapped, mark_bootstrapped
 from .validation import MIN_PASSWORD_LENGTH, normalize_phone_number
+from .verification import verification_required
 
 bp = Blueprint("auth", __name__)
 
@@ -17,8 +18,13 @@ _registration_lock = threading.Lock()
 
 
 @login_manager.user_loader
-def load_user(user_id):
-    return db.session.get(User, int(user_id))
+def load_user(session_token):
+    """Sessions and remember-me cookies carry the user's session token, not the
+    id: a token dies with the account and with every password change, and a
+    deleted account's token can never match the account created after it."""
+    if not session_token:
+        return None
+    return User.query.filter_by(session_token=session_token).first()
 
 
 def _registration_closed():
@@ -33,17 +39,23 @@ def _registration_closed():
 def registration_open():
     """Registration is for the owner's first account unless explicitly opened.
 
-    Phone numbers are not verified, so each extra account is someone who can
-    make this deployment call any number on the owner's Twilio balance.
+    Each extra account can make this deployment call phone numbers on the
+    owner's Twilio balance, which is why opening it turns on phone verification
+    by default (REQUIRE_PHONE_VERIFICATION).
     """
     if current_app.config["ALLOW_REGISTRATION"]:
         return True
-    return db.session.query(User.id).first() is None
+    # "No account yet" only counts on a fresh instance. Once an owner existed,
+    # deleting every account must not hand the deployment to the next visitor.
+    return not instance_bootstrapped() and db.session.query(User.id).first() is None
 
 
 @bp.app_context_processor
 def inject_registration_open():
-    return {"registration_open": registration_open}
+    return {
+        "registration_open": registration_open,
+        "phone_verification_required": verification_required,
+    }
 
 
 @bp.route("/register", methods=["GET", "POST"])
@@ -66,8 +78,8 @@ def register():
             flash(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.", "danger")
             return redirect(url_for("auth.register"))
 
-        # The phone number is whatever the registrant types and is never verified,
-        # so at minimum it has to be a plausible E.164 number.
+        # At minimum a plausible E.164 number. Ownership is checked with a code
+        # after login when REQUIRE_PHONE_VERIFICATION is on.
         phone_number, error = normalize_phone_number(request.form.get("phone_number"))
         if error:
             flash(error, "danger")
@@ -86,6 +98,7 @@ def register():
                 flash("Username or email already exists.", "danger")
                 return redirect(url_for("auth.register"))
             db.session.add(new_user)
+            mark_bootstrapped()
             db.session.commit()
 
         # Another process (only one is supported, but still) may have registered

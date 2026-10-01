@@ -18,8 +18,12 @@
       <input type="tel" name="phone_number" class="form-control" id="phone_number"
              placeholder="+14155550123" pattern="\+[1-9][0-9]{7,14}" required>
       <div class="form-text">
-        International format only (E.164), e.g. <code>+14155550123</code>. This number is
-        <strong>not</strong> verified &mdash; alerts call whatever is entered here.
+        International format only (E.164), e.g. <code>+14155550123</code>.
+        {% if phone_verification_required() %}
+          You will confirm it with a code sent by SMS before any alert can call it.
+        {% else %}
+          This deployment does not verify numbers: alerts call whatever is entered here.
+        {% endif %}
       </div>
     </div>
     <div class="mb-3">

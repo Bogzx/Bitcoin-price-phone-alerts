@@ -14,6 +14,7 @@ from xml.sax.saxutils import escape as xml_escape
 from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 
+from .config import phone_verification_required
 from .extensions import socketio
 from .models import Alert, NotificationLog, User, db, utcnow
 
@@ -233,13 +234,21 @@ class Notifier:
         """
         now = now or utcnow()
         cutoff = now - timedelta(seconds=self.REQUEUE_MAX_AGE_SECONDS)
+        verified_only = phone_verification_required(self.app.config)
         requeued = expired = 0
         with self.app.app_context():
             for entry in NotificationLog.query.filter_by(status="queued").all():
                 user = db.session.get(User, entry.user_id)
-                if user is None or entry.created_at < cutoff:
+                # The job goes to the user's *current* number, which may have changed
+                # (and not been verified yet) since the alert fired.
+                unverified = user is not None and verified_only and not user.phone_verified
+                if user is None or entry.created_at < cutoff or unverified:
                     entry.status = "failed"
-                    entry.detail = "Not delivered: the app restarted before sending it."
+                    entry.detail = (
+                        "Not delivered: the phone number is not verified."
+                        if unverified
+                        else "Not delivered: the app restarted before sending it."
+                    )
                     alert = db.session.get(Alert, entry.alert_id) if entry.alert_id else None
                     if alert is not None:
                         alert.notify_error = entry.detail

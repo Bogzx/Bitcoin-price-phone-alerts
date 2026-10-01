@@ -23,6 +23,14 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt
+      - name: No environments, databases or secrets tracked
+        # A Windows venv and a SQLite file with real user rows were committed in
+        # 2025 and are still in the history; this keeps them from coming back.
+        run: |
+          if git ls-files | grep -E '(^|/)(\.?venv|env|instance|__pycache__)/|\.(db|sqlite3?)$|(^|/)\.env$'; then
+            echo "::error::The files above must not be committed."
+            exit 1
+          fi
       - run: ruff check .
       # No network, no Twilio: the feed is disabled and Twilio is faked.
       - run: python -m pytest tests -q
@@ -32,3 +40,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t btc-alerts .
+      # The image must boot: gunicorn imports app:app, the feed is off (no network
+      # assumptions in CI) and /healthz answers (503, since no price is flowing).
+      - name: Boot the image
+        run: |
+          docker run -d --name smoke -p 5000:5000 -e SECRET_KEY=ci -e NOTIFY_DRY_RUN=true \
+            -e RUN_PRICE_FEED=false btc-alerts
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5000/healthz || true)
+            [ "$code" = "503" ] && break
+            sleep 1
+          done
+          docker logs smoke
+          test "$code" = "503"
+          curl -sf -o /dev/null http://127.0.0.1:5000/login

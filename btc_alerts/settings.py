@@ -52,9 +52,8 @@ def change_phone():
         flash("That is already your phone number.", "info")
         return redirect(url_for("settings.index"))
 
-    current_user.phone_number = phone_number
     # A code only ever proved ownership of the old number.
-    get_verifier().reset(current_user)
+    get_verifier().change_number(current_user, phone_number)
     db.session.commit()
     current_app.logger.info(
         f"User {current_user.id} changed their phone number to {mask_phone(phone_number)}"

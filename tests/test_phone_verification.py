@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from btc_alerts.config import load_config
-from btc_alerts.models import Alert, PhoneVerification, User, db, utcnow
+from btc_alerts.models import Alert, PhoneVerification, User, db
 from btc_alerts.verification import verification_required
 
 PHONE = "+14155550123"
@@ -220,11 +220,15 @@ def test_twilio_verify_sends_and_checks(client, user, twilio_verify):
     assert db.session.get(User, user.id).phone_verified
 
 
-def test_twilio_send_failure_is_reported_not_recorded(client, twilio_verify):
+def test_twilio_send_failure_is_reported_and_still_counts(client, twilio_verify):
+    """A failed send may still have cost money, so it counts toward the caps,
+    but it leaves no code that could be checked."""
     twilio_verify.fail_send = True
     body = client.post("/verify-phone/send", follow_redirects=True).get_data(as_text=True)
     assert "could not be sent" in body
-    assert PhoneVerification.query.count() == 0
+    assert PhoneVerification.query.one().status == "failed"
+    body = client.post("/verify-phone", data={"code": "424242"}, follow_redirects=True)
+    assert "Send yourself a code first" in body.get_data(as_text=True)
 
 
 def test_missing_verify_service_sid_is_a_clear_error(verified_app, client, services):
@@ -258,7 +262,7 @@ def test_alerts_of_unverified_users_never_fire(verified_app, services, user, mon
     tick(70000.0)
     assert calls == []
 
-    user.phone_verified_at = utcnow()
+    user.mark_phone_verified()
     db.session.commit()
     tick(70000.0)  # the user row changed, so the quiet band is dropped
     assert calls == [PHONE]

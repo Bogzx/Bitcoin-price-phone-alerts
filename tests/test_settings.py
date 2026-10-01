@@ -20,7 +20,7 @@ PASSWORD = "correct-horse"
 def user(app):
     user = User(username="sam", email="sam@example.com", phone_number="+14155550188")
     user.set_password(PASSWORD)
-    user.phone_verified_at = utcnow()
+    user.mark_phone_verified()
     db.session.add(user)
     db.session.commit()
     return user

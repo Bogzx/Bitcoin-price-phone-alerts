@@ -29,6 +29,15 @@
   re-registering cannot reset the caps.
 - A notification replayed after a restart is skipped when the user's current number is
   not verified.
+- **Verification is bound to the number.** A code is approved only if it is still
+  pending and the user still has the number it was sent to (conditional UPDATEs, both or
+  neither). The verified number is stored, and only a match with the current number
+  counts, in the gate, the engine and restart recovery. Before this, a number changed
+  during a slow Twilio check could end up verified. Sends reserve their slot before
+  contacting Twilio, so parallel requests cannot exceed the per-user or deployment caps.
+- The session-token and verified-number backfills skip databases whose `user` table lacks
+  the column (no automatic ALTER TABLE outside SQLite) and report it, instead of failing
+  at startup.
 - **Quiet band:** trade ticks that cannot change any alert skip the database (about
   2 ms → 0.02 ms per tick with 5 alerts). `ALERT_FULL_SCAN_SECONDS` bounds how long.
 - `scripts/bench_ticks.py`, and the `docs/` screenshots taken from a dry-run instance.

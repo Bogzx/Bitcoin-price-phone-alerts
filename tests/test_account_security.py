@@ -370,8 +370,8 @@ def test_requeue_skips_users_whose_current_number_is_not_verified(app, services,
     app.config["REQUIRE_PHONE_VERIFICATION"] = True
     calls = []
     monkeypatch.setattr(services.notifier, "call_user", lambda phone, msg: calls.append(phone))
-    verified = User(username="v", email="v@example.com", phone_number="+14155550141",
-                    phone_verified_at=utcnow())
+    verified = User(username="v", email="v@example.com", phone_number="+14155550141")
+    verified.mark_phone_verified()
     changed = User(username="c", email="c@example.com", phone_number="+14155550142")
     for user in (verified, changed):
         user.set_password(PASSWORD)

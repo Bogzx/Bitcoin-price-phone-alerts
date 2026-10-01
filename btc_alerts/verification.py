@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import re
 import secrets
+import threading
 from datetime import timedelta
 
 from flask import (
@@ -29,7 +30,7 @@ from flask_login import current_user, login_required
 
 from .config import phone_verification_required
 from .extensions import limiter
-from .models import PhoneVerification, db, utcnow
+from .models import PhoneVerification, User, db, utcnow
 from .notifications import mask_phone
 
 bp = Blueprint("verify", __name__)
@@ -75,61 +76,83 @@ class PhoneVerifier:
             )
         return client.verify.v2.services(sid)
 
+    # Serialises "count recent sends, then record this one". Without it, parallel
+    # requests all pass the caps before any of them is recorded. The app runs as
+    # one process (see README), so a process-wide lock covers every request.
+    _send_lock = threading.Lock()
+
+    def _reserve_send(self, user, now):
+        """Checks both send caps and records the send *before* it happens."""
+        with self._send_lock:
+            last_hour = PhoneVerification.query.filter(
+                PhoneVerification.created_at >= now - timedelta(hours=1)
+            )
+            limit = self.config["VERIFY_MAX_SENDS_PER_HOUR"]
+            if last_hour.filter(PhoneVerification.user_id == user.id).count() >= limit:
+                raise VerificationError(
+                    f"You have requested {limit} codes in the last hour. "
+                    "Please wait and try again."
+                )
+            # Each code is an SMS on the owner's Twilio balance, so many accounts each
+            # staying under their own limit must not add up to an unbounded bill.
+            total_limit = self.config["VERIFY_MAX_SENDS_PER_HOUR_TOTAL"]
+            if total_limit > 0 and last_hour.count() >= total_limit:
+                self.app.logger.warning(
+                    f"VERIFY_MAX_SENDS_PER_HOUR_TOTAL ({total_limit}) reached; refusing to "
+                    f"send a code to {mask_phone(user.phone_number)}."
+                )
+                raise VerificationError(
+                    "This deployment has sent too many verification codes in the last hour. "
+                    "Please try again later."
+                )
+            reservation = PhoneVerification(
+                user_id=user.id,
+                phone_number=user.phone_number,
+                status="sending",
+                created_at=now,
+                expires_at=now + timedelta(seconds=self.config["VERIFY_CODE_TTL_SECONDS"]),
+            )
+            db.session.add(reservation)
+            db.session.commit()
+            return reservation.id, reservation.phone_number
+
     def send(self, user):
         """Sends a new code to the user's current number. Raises VerificationError."""
-        now = utcnow()
-        last_hour = PhoneVerification.query.filter(
-            PhoneVerification.created_at >= now - timedelta(hours=1)
-        )
-        limit = self.config["VERIFY_MAX_SENDS_PER_HOUR"]
-        if last_hour.filter(PhoneVerification.user_id == user.id).count() >= limit:
-            raise VerificationError(
-                f"You have requested {limit} codes in the last hour. Please wait and try again."
-            )
-        # Each code is an SMS on the owner's Twilio balance, so many accounts each
-        # staying under their own limit must not add up to an unbounded bill.
-        total_limit = self.config["VERIFY_MAX_SENDS_PER_HOUR_TOTAL"]
-        if total_limit > 0 and last_hour.count() >= total_limit:
-            self.app.logger.warning(
-                f"VERIFY_MAX_SENDS_PER_HOUR_TOTAL ({total_limit}) reached; refusing to send "
-                f"a code to {mask_phone(user.phone_number)}."
-            )
-            raise VerificationError(
-                "This deployment has sent too many verification codes in the last hour. "
-                "Please try again later."
-            )
+        dry_run = self.config["NOTIFY_DRY_RUN"]
+        service = None if dry_run else self._verify_service()  # fails before reserving
+        reservation_id, phone = self._reserve_send(user, utcnow())
 
         code_hash = None
-        if self.config["NOTIFY_DRY_RUN"]:
+        if dry_run:
             code = f"{secrets.randbelow(10**6):06d}"
             code_hash = self._code_hash(code)
-            self.app.logger.info(
-                f"[dry-run] Verification code for {mask_phone(user.phone_number)}: {code}"
-            )
+            self.app.logger.info(f"[dry-run] Verification code for {mask_phone(phone)}: {code}")
         else:
-            service = self._verify_service()
             try:
-                service.verifications.create(to=user.phone_number, channel="sms")
+                service.verifications.create(to=phone, channel="sms")
             except Exception as exc:
+                # The reservation stays and keeps counting: a send that failed may
+                # still have cost money, and errors must not be a way around the caps.
+                PhoneVerification.query.filter_by(id=reservation_id).update(
+                    {"status": "failed"}, synchronize_session=False
+                )
+                db.session.commit()
                 self.app.logger.error(
-                    f"Twilio Verify refused to send to {mask_phone(user.phone_number)}: {exc}"
+                    f"Twilio Verify refused to send to {mask_phone(phone)}: {exc}"
                 )
                 raise VerificationError(
                     "The code could not be sent. Please try again later."
                 ) from exc
-            self.app.logger.info(f"Verification code sent to {mask_phone(user.phone_number)}")
+            self.app.logger.info(f"Verification code sent to {mask_phone(phone)}")
 
-        PhoneVerification.query.filter_by(user_id=user.id, status="pending").update(
-            {"status": "superseded"}
-        )
-        db.session.add(
-            PhoneVerification(
-                user_id=user.id,
-                phone_number=user.phone_number,
-                code_hash=code_hash,
-                created_at=now,
-                expires_at=now + timedelta(seconds=self.config["VERIFY_CODE_TTL_SECONDS"]),
-            )
+        PhoneVerification.query.filter(
+            PhoneVerification.user_id == user.id,
+            PhoneVerification.status == "pending",
+            PhoneVerification.id != reservation_id,
+        ).update({"status": "superseded"}, synchronize_session=False)
+        # Only if still "sending": a number change meanwhile superseded it.
+        PhoneVerification.query.filter_by(id=reservation_id, status="sending").update(
+            {"status": "pending", "code_hash": code_hash}, synchronize_session=False
         )
         db.session.commit()
 
@@ -137,7 +160,8 @@ class PhoneVerifier:
         """Returns True and marks the phone verified when `code` is right.
 
         Returns False for a wrong code; raises VerificationError when no usable
-        code exists (none sent, expired, too many attempts).
+        code exists (none sent, expired, too many attempts) or when the number
+        changed while the code was being checked.
         """
         pending = (
             PhoneVerification.query.filter_by(
@@ -148,8 +172,8 @@ class PhoneVerifier:
         )
         if pending is None:
             raise VerificationError("Send yourself a code first.")
-        now = utcnow()
-        if now >= pending.expires_at:
+        pending_id, phone = pending.id, pending.phone_number
+        if utcnow() >= pending.expires_at:
             pending.status = "expired"
             db.session.commit()
             raise VerificationError("That code has expired. Send a new one.")
@@ -157,7 +181,7 @@ class PhoneVerifier:
         # parallel guesses cannot both pass a stale "attempts < max" check.
         claimed = (
             PhoneVerification.query.filter(
-                PhoneVerification.id == pending.id,
+                PhoneVerification.id == pending_id,
                 PhoneVerification.attempts < self.config["VERIFY_MAX_ATTEMPTS"],
             ).update(
                 {PhoneVerification.attempts: PhoneVerification.attempts + 1},
@@ -174,20 +198,41 @@ class PhoneVerifier:
         if pending.code_hash is not None:
             approved = hmac.compare_digest(pending.code_hash, self._code_hash(code))
         else:
-            approved = self._check_with_twilio(user, code)
+            approved = self._check_with_twilio(phone, code)
         if not approved:
             return False
 
-        pending.status = "approved"
-        user.phone_verified_at = now
+        # The Twilio round trip can take seconds, and the number may have changed
+        # meanwhile (settings, another session). Approve only if the code is still
+        # pending AND the user still has the number it was sent to; both rows
+        # change in one transaction or neither does.
+        code_approved = PhoneVerification.query.filter_by(
+            id=pending_id, status="pending"
+        ).update({"status": "approved"}, synchronize_session=False)
+        user_verified = User.query.filter(
+            User.id == user.id, User.phone_number == phone
+        ).update(
+            {"phone_verified_at": utcnow(), "phone_verified_number": phone},
+            synchronize_session=False,
+        )
+        if code_approved != 1 or user_verified != 1:
+            db.session.rollback()
+            self.app.logger.warning(
+                f"Code for {mask_phone(phone)} was right, but user {user.id}'s number "
+                "changed while it was being checked; not verified."
+            )
+            raise VerificationError(
+                "Your phone number changed while the code was being checked. "
+                "Send a code to the new number."
+            )
         db.session.commit()
-        self.app.logger.info(f"Phone {mask_phone(user.phone_number)} verified for user {user.id}")
+        self.app.logger.info(f"Phone {mask_phone(phone)} verified for user {user.id}")
         return True
 
-    def _check_with_twilio(self, user, code):
+    def _check_with_twilio(self, phone, code):
         service = self._verify_service()
         try:
-            result = service.verification_checks.create(to=user.phone_number, code=code)
+            result = service.verification_checks.create(to=phone, code=code)
         except Exception as exc:
             # Twilio answers 404 once a verification expired, was approved or
             # used up its attempts.
@@ -195,12 +240,22 @@ class PhoneVerifier:
             return False
         return getattr(result, "status", None) == "approved"
 
-    def reset(self, user):
-        """Forgets the verification, e.g. after the number changed."""
-        user.phone_verified_at = None
-        PhoneVerification.query.filter_by(user_id=user.id, status="pending").update(
-            {"status": "superseded"}
+    def change_number(self, user, phone_number):
+        """Sets a new number and forgets every verification of the old one.
+
+        One explicit UPDATE rather than ORM change tracking: an object loaded
+        before a concurrent verification would see nothing to reset and leave
+        that verification in place.
+        """
+        User.query.filter_by(id=user.id).update(
+            {"phone_number": phone_number, "phone_verified_at": None,
+             "phone_verified_number": None},
+            synchronize_session=False,
         )
+        PhoneVerification.query.filter(
+            PhoneVerification.user_id == user.id,
+            PhoneVerification.status.in_(("pending", "sending")),
+        ).update({"status": "superseded"}, synchronize_session=False)
 
 
 def get_verifier():

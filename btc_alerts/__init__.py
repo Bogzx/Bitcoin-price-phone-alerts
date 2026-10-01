@@ -14,8 +14,10 @@ from .alerts import bp as alerts_bp
 from .auth import bp as auth_bp
 from .config import load_config
 from .extensions import csrf, limiter, login_manager, socketio
-from .models import add_missing_columns, db
+from .models import db, upgrade_database
 from .services import build_services, get_services, start_background_services
+from .settings import bp as settings_bp
+from .verification import bp as verify_bp, verification_required
 
 __all__ = ["create_app", "get_services", "start_background_services"]
 
@@ -52,11 +54,31 @@ def create_app(overrides=None):
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(alerts_bp)
+    app.register_blueprint(verify_bp)
+    app.register_blueprint(settings_bp)
+    _warn_about_unsafe_verification_settings(app)
 
-    # Create missing tables and add columns an older database lacks.
+    # Create missing tables and bring an older database up to date.
     with app.app_context():
         db.create_all()
-        add_missing_columns(db.engine, app.logger)
+        upgrade_database(db.engine, app.logger)
 
     app.extensions["btc_alerts"] = build_services(app)
     return app
+
+
+def _warn_about_unsafe_verification_settings(app):
+    config = app.config
+    if not verification_required(app):
+        if config["ALLOW_REGISTRATION"]:
+            app.logger.warning(
+                "ALLOW_REGISTRATION is on but REQUIRE_PHONE_VERIFICATION is off: anyone "
+                "who registers can make this deployment call any number on your Twilio "
+                "balance."
+            )
+        return
+    if not config["NOTIFY_DRY_RUN"] and not config.get("TWILIO_VERIFY_SERVICE_SID"):
+        app.logger.error(
+            "Phone verification is required but TWILIO_VERIFY_SERVICE_SID is not set: "
+            "nobody can verify a number, so no alert will fire."
+        )

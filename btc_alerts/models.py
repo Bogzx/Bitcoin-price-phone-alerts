@@ -1,6 +1,8 @@
+import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import inspect, text
+from sqlalchemy import MetaData, inspect, text
+from sqlalchemy.schema import CreateTable
 
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -9,12 +11,25 @@ from flask_login import UserMixin
 db = SQLAlchemy()
 
 
+# user_id given to rows that outlive a deleted account (notification log, sent
+# codes): they still count toward the deployment-wide caps, but belong to no one.
+DELETED_USER_ID = 0
+
+
 def utcnow():
     """Naive UTC timestamp (datetime.utcnow() is deprecated in Python 3.12)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def new_session_token():
+    return secrets.token_urlsafe(32)
+
+
 class User(UserMixin, db.Model):
+    # AUTOINCREMENT: SQLite would otherwise hand a deleted user's id to the next
+    # account, and anything still keyed by that id would follow it.
+    __table_args__ = {"sqlite_autoincrement": True}
+
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
@@ -24,7 +39,34 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     # Timestamp of the last outbound call/SMS, used for the per-user cooldown.
     last_notified_at = db.Column(db.DateTime, nullable=True)
+    # When the user proved they own a number with a one-time code, and which
+    # number. Only a match with the current phone_number counts as verified, so a
+    # stale write can never verify a number the code was not sent to.
+    phone_verified_at = db.Column(db.DateTime, nullable=True)
+    phone_verified_number = db.Column(db.String(20), nullable=True)
+    # What the session and the remember-me cookie identify the user by, instead
+    # of the id. Rotating it signs out every other session of this user.
+    session_token = db.Column(
+        db.String(64), unique=True, nullable=False, default=new_session_token
+    )
     alerts = db.relationship('Alert', backref='user', lazy=True)
+
+    @property
+    def phone_verified(self):
+        return (
+            self.phone_verified_at is not None
+            and self.phone_verified_number == self.phone_number
+        )
+
+    def mark_phone_verified(self, now=None):
+        self.phone_verified_at = now or utcnow()
+        self.phone_verified_number = self.phone_number
+
+    def get_id(self):
+        return self.session_token
+
+    def rotate_session_token(self):
+        self.session_token = new_session_token()
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -131,6 +173,154 @@ class NotificationLog(db.Model):
     # the call went out and only the SMS was still being retried.
     delivered = db.Column(db.String(20), nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+
+
+class PhoneVerification(db.Model):
+    """One verification code sent to a user's phone, and what became of it."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    # The number the code went to: a code proves ownership of this number only.
+    phone_number = db.Column(db.String(20), nullable=False)
+    # HMAC of a locally generated code (dry-run mode). Twilio Verify keeps its own
+    # codes, so this is empty for codes sent through it.
+    code_hash = db.Column(db.String(64), nullable=True)
+    # "pending", "approved", "superseded" (a newer code was sent) or "expired".
+    status = db.Column(db.String(12), nullable=False, default="pending")
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+
+class InstanceState(db.Model):
+    """Small key/value facts about this deployment, e.g. when it got its owner."""
+    key = db.Column(db.String(64), primary_key=True)
+    value = db.Column(db.String(255), nullable=True)
+
+
+BOOTSTRAPPED = "bootstrapped_at"
+
+
+def instance_bootstrapped():
+    """True once any account has ever existed on this deployment."""
+    return db.session.get(InstanceState, BOOTSTRAPPED) is not None
+
+
+def mark_bootstrapped():
+    if not instance_bootstrapped():
+        db.session.add(InstanceState(key=BOOTSTRAPPED, value=utcnow().isoformat()))
+
+
+def upgrade_database(engine, logger=None):
+    """Brings a database from an older version up to date. Additive and idempotent.
+
+    Must run inside an application context, after db.create_all().
+    """
+    add_missing_columns(engine, logger)
+    backfill_session_tokens(engine, logger)
+    backfill_verified_numbers(engine)
+    rebuild_user_table_with_autoincrement(engine, logger)
+    if db.session.query(User.id).first() is not None:
+        mark_bootstrapped()
+        db.session.commit()
+
+
+def _has_column(engine, table, column):
+    inspector = inspect(engine)
+    return inspector.has_table(table) and any(
+        col["name"] == column for col in inspector.get_columns(table)
+    )
+
+
+def backfill_session_tokens(engine, logger=None):
+    """Gives users created before session tokens existed a token of their own.
+
+    Other databases get no automatic ALTER TABLE (see add_missing_columns): if the
+    column is missing there, say so instead of failing at startup.
+    """
+    if not _has_column(engine, "user", "session_token"):
+        if logger is not None:
+            logger.error(
+                'The "user" table has no session_token column. Add it '
+                '(VARCHAR(64), unique) before users can log in.'
+            )
+        return
+    with engine.begin() as conn:
+        ids = conn.execute(text('SELECT id FROM "user" WHERE session_token IS NULL')).scalars()
+        for user_id in list(ids):
+            conn.execute(
+                text('UPDATE "user" SET session_token = :token WHERE id = :id'),
+                {"token": new_session_token(), "id": user_id},
+            )
+
+
+def backfill_verified_numbers(engine):
+    """Users verified before phone_verified_number existed verified their current number."""
+    if not _has_column(engine, "user", "phone_verified_number"):
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            'UPDATE "user" SET phone_verified_number = phone_number '
+            "WHERE phone_verified_at IS NOT NULL AND phone_verified_number IS NULL"
+        ))
+
+
+def rebuild_user_table_with_autoincrement(engine, logger=None):
+    """Rebuilds a `user` table created without AUTOINCREMENT. Returns True if it did.
+
+    SQLite cannot add AUTOINCREMENT to an existing table, so this follows the
+    documented procedure: create the new table, copy the rows, drop the old
+    one, rename. The id sequence starts above every user id still referenced
+    anywhere, so ids freed before the upgrade are not handed out again either.
+    """
+    if engine.dialect.name != "sqlite":
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'user'")
+        ).first()
+        if row is None or "AUTOINCREMENT" in row[0].upper():
+            return False
+        if conn.execute(text("PRAGMA foreign_keys")).scalar():
+            if logger is not None:
+                logger.warning(
+                    "The user table has no AUTOINCREMENT and foreign keys are enforced, "
+                    "so it was not rebuilt; deleted users' ids may be reused."
+                )
+            return False
+        existing = {col[1] for col in conn.execute(text('PRAGMA table_info("user")'))}
+
+    table = User.__table__
+    staging = table.to_metadata(MetaData(), name="user_rebuild")
+    columns = ", ".join(f'"{col.name}"' for col in table.columns if col.name in existing)
+    floors = ['(SELECT MAX(id) FROM "user")']
+    for other in ("alert", "notification_log", "phone_verification"):
+        if inspect(engine).has_table(other):
+            floors.append(f'(SELECT MAX(user_id) FROM "{other}")')
+    floor_sql = "SELECT MAX(COALESCE(v, 0)) FROM (" + " UNION ALL ".join(
+        f"SELECT {expr} AS v" for expr in floors
+    ) + ")"
+    script = ";\n".join([
+        "BEGIN",
+        str(CreateTable(staging).compile(dialect=engine.dialect)).strip(),
+        f'INSERT INTO user_rebuild ({columns}) SELECT {columns} FROM "user"',
+        'DROP TABLE "user"',
+        'ALTER TABLE user_rebuild RENAME TO "user"',
+        "DELETE FROM sqlite_sequence WHERE name IN ('user', 'user_rebuild')",
+        f"INSERT INTO sqlite_sequence (name, seq) VALUES ('user', ({floor_sql}))",
+        "COMMIT",
+    ]) + ";"
+    raw = engine.raw_connection()
+    try:
+        try:
+            raw.driver_connection.executescript(script)
+        except Exception:
+            raw.driver_connection.execute("ROLLBACK")
+            raise
+    finally:
+        raw.close()
+    if logger is not None:
+        logger.warning("Rebuilt the user table with AUTOINCREMENT so user ids are never reused.")
+    return True
 
 
 def add_missing_columns(engine, logger=None):

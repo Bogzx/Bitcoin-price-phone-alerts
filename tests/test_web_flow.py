@@ -4,33 +4,24 @@ the per-user alert cap holds, and thresholds are validated.
 
 import pytest
 
-import app as app_module
-from app import app as flask_app
-from models import db, Alert, User
+from btc_alerts import auth
+from btc_alerts.extensions import socketio
+from btc_alerts.models import Alert, NotificationLog, User, db
 
 
 @pytest.fixture
-def client():
-    flask_app.config.update(
-        TESTING=True,
-        WTF_CSRF_ENABLED=True,
-        SESSION_COOKIE_SECURE=False,
-        MAX_ACTIVE_ALERTS_PER_USER=5,
-    )
-    # The auth rate limits are real (and tested separately); they would otherwise
-    # make these tests order-dependent.
-    app_module.limiter.enabled = False
-    app_module.record_price(70000.0)
-    with flask_app.app_context():
-        db.drop_all()
-        db.create_all()
-        with flask_app.test_client() as client:
-            yield client
-        db.session.remove()
-        db.drop_all()
-    app_module.current_btc_price = None
-    app_module.feed_status.last_tick_monotonic = None
-    app_module.limiter.enabled = True
+def client(app, services):
+    # CSRF is on here, unlike the rest of the suite. The auth rate limits stay
+    # off (they are tested separately); they would make these tests order-dependent.
+    app.config.update(WTF_CSRF_ENABLED=True, MAX_ACTIVE_ALERTS_PER_USER=5)
+    services.feed.record_price(70000.0)
+    with app.test_client() as client:
+        yield client
+
+
+@pytest.fixture
+def feed(services):
+    return services.feed
 
 
 def make_user(client):
@@ -164,38 +155,35 @@ def test_registration_accepts_e164_and_hashes_the_password(client):
     assert "hunter2-long" not in user.password_hash
 
 
-def test_login_is_rate_limited(client):
-    app_module.limiter.enabled = True
-    app_module.limiter.reset()
-    token = csrf_token(client, "/login")
-    statuses = [
-        client.post(
-            "/login", data={"csrf_token": token, "username": "bob", "password": "wrong"}
-        ).status_code
-        for _ in range(15)
-    ]
-    app_module.limiter.enabled = False
+def test_login_is_rate_limited(make_app):
+    app = make_app(RATELIMIT_ENABLED=True)
+    with app.app_context(), app.test_client() as client:
+        statuses = [
+            client.post("/login", data={"username": "bob", "password": "wrong"}).status_code
+            for _ in range(15)
+        ]
+        db.drop_all()
     assert 429 in statuses, statuses
 
 
-def test_socketio_connect_is_rejected_for_anonymous_clients(client):
-    sio = app_module.socketio.test_client(flask_app)
+def test_socketio_connect_is_rejected_for_anonymous_clients(app, client):
+    sio = socketio.test_client(app)
     assert sio.is_connected() is False
 
 
-def test_socketio_connect_works_for_logged_in_clients(client):
+def test_socketio_connect_works_for_logged_in_clients(app, client):
     """Guards against the auth/CSRF hardening silently killing live updates."""
     make_user(client)
-    sio = app_module.socketio.test_client(flask_app, flask_test_client=client)
+    sio = socketio.test_client(app, flask_test_client=client)
     assert sio.is_connected() is True
     sio.disconnect()
 
 
-def test_stale_price_blocks_alert_creation(client):
+def test_stale_price_blocks_alert_creation(client, feed):
     """The alert direction is chosen against the live price; a stale one lies."""
     make_user(client)
     token = csrf_token(client, "/add_alert")
-    app_module.feed_status.last_tick_monotonic -= 10_000
+    feed.status.last_tick_monotonic -= 10_000
     response = client.post(
         "/add_alert",
         data={"csrf_token": token, "mode": "absolute", "price_threshold": "80000"},
@@ -205,10 +193,10 @@ def test_stale_price_blocks_alert_creation(client):
     assert Alert.query.count() == 0
 
 
-def test_dashboard_shows_stale_feed_banner(client):
+def test_dashboard_shows_stale_feed_banner(client, feed):
     make_user(client)
     assert 'id="feed-stale"' not in client.get("/").get_data(as_text=True)
-    app_module.feed_status.last_tick_monotonic -= 10_000
+    feed.status.last_tick_monotonic -= 10_000
     assert 'id="feed-stale"' in client.get("/").get_data(as_text=True)
 
 
@@ -227,8 +215,8 @@ def register_form(client, username):
     )
 
 
-def test_registration_closes_after_the_first_account(client):
-    flask_app.config["ALLOW_REGISTRATION"] = False
+def test_registration_closes_after_the_first_account(app, client):
+    app.config["ALLOW_REGISTRATION"] = False
     assert "Register here" in client.get("/login").get_data(as_text=True)
     register_form(client, "owner")
     assert User.query.count() == 1
@@ -239,19 +227,14 @@ def test_registration_closes_after_the_first_account(client):
     assert "Register here" not in client.get("/login").get_data(as_text=True)
 
 
-def test_allow_registration_reopens_signup(client):
-    flask_app.config["ALLOW_REGISTRATION"] = True
-    try:
-        register_form(client, "owner")
-        register_form(client, "friend")
-        assert User.query.count() == 2
-    finally:
-        flask_app.config["ALLOW_REGISTRATION"] = False
+def test_allow_registration_reopens_signup(app, client):
+    app.config["ALLOW_REGISTRATION"] = True
+    register_form(client, "owner")
+    register_form(client, "friend")
+    assert User.query.count() == 2
 
 
 def test_dashboard_lists_recent_notifications(client):
-    from models import NotificationLog
-
     user = make_user(client)
     db.session.add(
         NotificationLog(user_id=user.id, channel="call", status="sent", message="BTC rose")
@@ -310,11 +293,11 @@ def test_logout_requires_post(client):
     assert client.get("/").status_code == 302  # back to login
 
 
-def test_first_account_registered_during_hashing_closes_signup(client, monkeypatch):
+def test_first_account_registered_during_hashing_closes_signup(app, client, monkeypatch):
     """Two simultaneous first registrations: both pass the 'no users yet' check,
     then spend ~100 ms hashing. Here the other one commits during that window;
     this request must then be refused, not become a second account."""
-    flask_app.config["ALLOW_REGISTRATION"] = False
+    app.config["ALLOW_REGISTRATION"] = False
     original = User.set_password
 
     def hash_while_another_signup_lands(self, password):
@@ -331,15 +314,15 @@ def test_first_account_registered_during_hashing_closes_signup(client, monkeypat
     assert [u.username for u in User.query.all()] == ["rival"]
 
 
-def test_lower_id_wins_if_another_process_registered_first(client, monkeypatch):
+def test_lower_id_wins_if_another_process_registered_first(app, client, monkeypatch):
     """Cross-process backstop: if the in-process check was passed but a lower id
     exists after commit, the newcomer is removed again."""
-    flask_app.config["ALLOW_REGISTRATION"] = False
+    app.config["ALLOW_REGISTRATION"] = False
     owner = User(username="owner", email="owner@example.com",
                  phone_number="+14155550100", password_hash="x")
     db.session.add(owner)
     db.session.commit()
-    monkeypatch.setattr(app_module, "registration_open", lambda: True)  # the lost race
+    monkeypatch.setattr(auth, "registration_open", lambda: True)  # the lost race
     body = register_form(client, "second").get_data(as_text=True)
     assert "Registration is closed" in body
     assert [u.username for u in User.query.all()] == ["owner"]

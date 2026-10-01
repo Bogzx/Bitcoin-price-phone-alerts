@@ -4,7 +4,7 @@ import sqlite3
 
 from sqlalchemy import create_engine
 
-from models import add_missing_columns
+from btc_alerts.models import add_missing_columns
 
 OLD_SCHEMA = """
 CREATE TABLE user (

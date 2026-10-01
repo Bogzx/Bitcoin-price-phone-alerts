@@ -177,7 +177,10 @@ class AlertEngine:
         only those of users who verified their number."""
         query = Alert.query.filter_by(triggered=False)
         if verification_required(self.app):
-            query = query.join(User).filter(User.phone_verified_at.isnot(None))
+            query = query.join(User).filter(
+                User.phone_verified_at.isnot(None),
+                User.phone_verified_number == User.phone_number,
+            )
         return query.all()
 
     @staticmethod

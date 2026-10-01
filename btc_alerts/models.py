@@ -39,9 +39,11 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     # Timestamp of the last outbound call/SMS, used for the per-user cooldown.
     last_notified_at = db.Column(db.DateTime, nullable=True)
-    # When the user proved they own phone_number with a one-time code. Cleared
-    # whenever the number changes.
+    # When the user proved they own a number with a one-time code, and which
+    # number. Only a match with the current phone_number counts as verified, so a
+    # stale write can never verify a number the code was not sent to.
     phone_verified_at = db.Column(db.DateTime, nullable=True)
+    phone_verified_number = db.Column(db.String(20), nullable=True)
     # What the session and the remember-me cookie identify the user by, instead
     # of the id. Rotating it signs out every other session of this user.
     session_token = db.Column(
@@ -51,7 +53,14 @@ class User(UserMixin, db.Model):
 
     @property
     def phone_verified(self):
-        return self.phone_verified_at is not None
+        return (
+            self.phone_verified_at is not None
+            and self.phone_verified_number == self.phone_number
+        )
+
+    def mark_phone_verified(self, now=None):
+        self.phone_verified_at = now or utcnow()
+        self.phone_verified_number = self.phone_number
 
     def get_id(self):
         return self.session_token
@@ -207,15 +216,34 @@ def upgrade_database(engine, logger=None):
     Must run inside an application context, after db.create_all().
     """
     add_missing_columns(engine, logger)
-    backfill_session_tokens(engine)
+    backfill_session_tokens(engine, logger)
+    backfill_verified_numbers(engine)
     rebuild_user_table_with_autoincrement(engine, logger)
     if db.session.query(User.id).first() is not None:
         mark_bootstrapped()
         db.session.commit()
 
 
-def backfill_session_tokens(engine):
-    """Gives users created before session tokens existed a token of their own."""
+def _has_column(engine, table, column):
+    inspector = inspect(engine)
+    return inspector.has_table(table) and any(
+        col["name"] == column for col in inspector.get_columns(table)
+    )
+
+
+def backfill_session_tokens(engine, logger=None):
+    """Gives users created before session tokens existed a token of their own.
+
+    Other databases get no automatic ALTER TABLE (see add_missing_columns): if the
+    column is missing there, say so instead of failing at startup.
+    """
+    if not _has_column(engine, "user", "session_token"):
+        if logger is not None:
+            logger.error(
+                'The "user" table has no session_token column. Add it '
+                '(VARCHAR(64), unique) before users can log in.'
+            )
+        return
     with engine.begin() as conn:
         ids = conn.execute(text('SELECT id FROM "user" WHERE session_token IS NULL')).scalars()
         for user_id in list(ids):
@@ -223,6 +251,17 @@ def backfill_session_tokens(engine):
                 text('UPDATE "user" SET session_token = :token WHERE id = :id'),
                 {"token": new_session_token(), "id": user_id},
             )
+
+
+def backfill_verified_numbers(engine):
+    """Users verified before phone_verified_number existed verified their current number."""
+    if not _has_column(engine, "user", "phone_verified_number"):
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            'UPDATE "user" SET phone_verified_number = phone_number '
+            "WHERE phone_verified_at IS NOT NULL AND phone_verified_number IS NULL"
+        ))
 
 
 def rebuild_user_table_with_autoincrement(engine, logger=None):

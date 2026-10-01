@@ -53,3 +53,44 @@ def test_non_sqlite_engines_are_left_alone():
             name = "postgresql"
 
     assert add_missing_columns(FakeEngine()) == []
+
+
+def test_backfills_skip_a_user_table_without_the_new_columns(tmp_path, caplog):
+    """Other databases get no automatic ALTER TABLE (only SQLite does): a user
+    table still missing session_token / phone_verified_number must not crash
+    startup, and the missing column is reported."""
+    import logging
+
+    from btc_alerts.models import backfill_session_tokens, backfill_verified_numbers
+
+    path = tmp_path / "no_columns.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_SCHEMA)
+    conn.close()
+    engine = create_engine(f"sqlite:///{path}")
+    logger = logging.getLogger("schema-test")
+
+    backfill_session_tokens(engine, logger)
+    backfill_verified_numbers(engine)
+
+    assert "no session_token column" in caplog.text
+
+
+def test_users_verified_before_the_upgrade_keep_their_verification(tmp_path):
+    from btc_alerts.models import backfill_verified_numbers
+
+    path = tmp_path / "verified.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_SCHEMA)
+    conn.execute("ALTER TABLE user ADD COLUMN phone_verified_at DATETIME")
+    conn.execute("ALTER TABLE user ADD COLUMN phone_verified_number VARCHAR(20)")
+    conn.execute("UPDATE user SET phone_verified_at = '2026-09-30 10:00:00'")
+    conn.commit()
+    conn.close()
+
+    backfill_verified_numbers(create_engine(f"sqlite:///{path}"))
+
+    conn = sqlite3.connect(path)
+    row = conn.execute("SELECT phone_number, phone_verified_number FROM user").fetchone()
+    conn.close()
+    assert row == ("+14155550123", "+14155550123")
